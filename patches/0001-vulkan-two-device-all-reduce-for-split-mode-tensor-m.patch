@@ -1,0 +1,447 @@
+From d7b2f90595441c4b1f8f869f73740a3d927711b1 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Wed, 30 Sep 2026 23:48:19 -0400
+Subject: [PATCH 01/12] vulkan : two-device all-reduce for --split-mode tensor,
+ meta all-reduce profiler
+
+Vulkan has no device-to-device copy, so the meta backend's generic all-reduce
+stops both devices several times per exchange. This adds a backend all-reduce
+for exactly two Vulkan devices through a block of host memory both import
+(VK_EXT_external_memory_host): each device copies its partial into its slot,
+one submit+wait on both, then each copies the other's slot and adds it, queued
+behind the next subgraph. Anything else falls back to the generic path;
+GGML_VK_DISABLE_COMM=1 forces it for A/B.
+
+ggml_vk_synchronize is split into a submit half and a wait half so both devices
+can be submitted before either is waited on.
+
+GGML_META_PROFILE=1 times the all-reduces between subgraphs in the meta backend
+(count, microseconds, bytes, share of the graph), printed every 64 graphs.
+
+Measured on two Arc Pro B60s, Windows 11, tg128 vs one card:
+  granite 30B dense     generic 0.85x -> comm 1.12x
+  qwen2.5-coder 14B     generic 0.65x -> comm 0.92x
+  qwen3 30B-A3B MoE     generic 0.33x -> comm 0.49x
+Per-exchange time 190 us -> 150 us; the remaining cost is the one stop.
+---
+ ggml/src/ggml-backend-meta.cpp       |  40 ++++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 280 +++++++++++++++++++++++++--
+ 2 files changed, 300 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index fb35be352..32792fbfd 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -10,6 +10,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+@@ -2467,6 +2468,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
++    // GGML_META_PROFILE=1: time the all-reduces between subgraphs. Each one is timed from a point where every backend
++    // has finished the preceding subgraph to the point where the all-reduce has completed on every backend. The extra
++    // synchronizations cost speed, so use this to attribute time, not to benchmark. Printed every 64 graphs.
++    static const bool profile = getenv("GGML_META_PROFILE") != nullptr;
++    static int64_t prof_graphs = 0, prof_reduces = 0, prof_reduce_us = 0, prof_reduce_bytes = 0, prof_graph_us = 0;
++    const int64_t prof_t_graph = profile ? ggml_time_us() : 0;
++    auto sync_all = [&]() {
++        for (size_t j = 0; j < n_backends; j++) {
++            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
++        }
++    };
++
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+@@ -2477,6 +2490,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
++            int64_t prof_t_reduce = 0;
++            if (profile) {
++                sync_all();
++                prof_t_reduce = ggml_time_us();
++            }
++
+             bool backend_allreduce_success = false;
+             if (backend_ctx->comm_ctx) {
+                 std::vector<ggml_tensor *> nodes;
+@@ -2495,6 +2514,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                     return status;
+                 }
+             }
++
++            if (profile) {
++                sync_all();
++                prof_reduce_us += ggml_time_us() - prof_t_reduce;
++                prof_reduces++;
++                const ggml_cgraph * cg = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
++                prof_reduce_bytes += ggml_nbytes(cg->nodes[cg->n_nodes - 1]);
++            }
++        }
++    }
++
++    if (profile) {
++        sync_all();
++        prof_graph_us += ggml_time_us() - prof_t_graph;
++        if (++prof_graphs % 64 == 0) {
++            // straight to stderr: llama-bench silences the ggml log unless -v
++            fprintf(stderr, "%s: last 64 graphs: %.1f all-reduces/graph, %.1f us each (%.1f KB), %.0f us/graph, all-reduce share %.0f%%\n",
++                __func__, prof_reduces / 64.0, prof_reduces ? (double) prof_reduce_us / prof_reduces : 0.0,
++                prof_reduces ? prof_reduce_bytes / 1024.0 / prof_reduces : 0.0, prof_graph_us / 64.0,
++                prof_graph_us ? 100.0 * prof_reduce_us / prof_graph_us : 0.0);
++            prof_reduces = prof_reduce_us = prof_reduce_bytes = prof_graph_us = 0;
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 33936acae..cc65699c7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -13513,40 +13513,47 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
+     return false;
+ }
+ 
+-void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+-    VK_LOG_DEBUG("ggml_vk_synchronize()");
++// ggml_vk_synchronize in two halves, so a caller driving several backends can submit all of them before waiting on
++// any (the two-device all-reduce below). ggml_vk_synchronize() is the submit half followed by the wait half.
++struct vk_sync_ticket {
++    bool                do_transfer = false;
++    bool                pending     = false;
++    vk_context          compute_ctx;
++    vk_command_buffer * cmd_buf     = nullptr;
++};
+ 
+-    bool do_transfer = !ctx->compute_ctx.expired();
++static vk_sync_ticket ggml_vk_synchronize_submit(ggml_backend_vk_context * ctx) {
++    vk_sync_ticket t;
++    t.do_transfer = !ctx->compute_ctx.expired();
+ 
+     if (ggml_vk_submit_transfer_ctx(ctx)) {
+         ctx->submit_pending = true;
+     }
+ 
+-    vk_context compute_ctx;
+-    vk_command_buffer* cmd_buf = nullptr;
+-    if (do_transfer) {
+-        compute_ctx = ctx->compute_ctx.lock();
+-        if (compute_ctx->s) {
+-            cmd_buf = compute_ctx->s->buffer;
++    if (t.do_transfer) {
++        t.compute_ctx = ctx->compute_ctx.lock();
++        if (t.compute_ctx->s) {
++            t.cmd_buf = t.compute_ctx->s->buffer;
+         }
+ 
+-        ggml_vk_ctx_end(compute_ctx);
++        ggml_vk_ctx_end(t.compute_ctx);
+ 
+-        for (auto& cpy : compute_ctx->in_memcpys) {
++        for (auto& cpy : t.compute_ctx->in_memcpys) {
+             memcpy(cpy.dst, cpy.src, cpy.n);
+         }
+ 
+         if (ctx->device->serialize_submissions) {
+-            ggml_vk_submit(compute_ctx, ctx->fence);
++            ggml_vk_submit(t.compute_ctx, ctx->fence);
+             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
+             ctx->device->device.resetFences({ ctx->fence });
+         } else {
+-            ggml_vk_submit(compute_ctx, {});
++            ggml_vk_submit(t.compute_ctx, {});
+         }
+         ctx->submit_pending = true;
+     }
+ 
+-    if (ctx->submit_pending) {
++    t.pending = ctx->submit_pending;
++    if (t.pending) {
+         if (ctx->device->serialize_submissions) {
+             ctx->submit_pending = false;
+         } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+@@ -13566,24 +13573,36 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+         } else {
+             ctx->device->compute_queue->handle->submit({}, ctx->fence);
+         }
++    }
++    return t;
++}
++
++static void ggml_vk_synchronize_wait(ggml_backend_vk_context * ctx, vk_sync_ticket & t) {
++    if (t.pending) {
+         if (!ctx->device->serialize_submissions) {
+             ggml_vk_wait_for_fence(ctx);
+         }
+         ctx->submit_pending = false;
+-        if (cmd_buf) {
+-            cmd_buf->in_use = false;
+-            cmd_buf->buf.reset();
++        if (t.cmd_buf) {
++            t.cmd_buf->in_use = false;
++            t.cmd_buf->buf.reset();
+         }
+     }
+ 
+-    if (do_transfer) {
+-        for (auto& cpy : compute_ctx->out_memcpys) {
++    if (t.do_transfer) {
++        for (auto& cpy : t.compute_ctx->out_memcpys) {
+             memcpy(cpy.dst, cpy.src, cpy.n);
+         }
+         ctx->compute_ctx.reset();
+     }
+ }
+ 
++void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
++    VK_LOG_DEBUG("ggml_vk_synchronize()");
++    vk_sync_ticket t = ggml_vk_synchronize_submit(ctx);
++    ggml_vk_synchronize_wait(ctx, t);
++}
++
+ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+@@ -16322,11 +16341,232 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
+     return devices[device];
+ }
+ 
++// Tensor parallelism (--split-mode tensor): all-reduce for exactly two Vulkan devices.
++//
++// Vulkan cannot copy between two devices, so the meta backend's generic all-reduce stops both devices several times
++// per exchange: synchronize both, read one partial back to the CPU, write it to the other device, and the same the
++// other way. Measured on two Arc Pro B60s (Windows): ~190 us per exchange, two exchanges per layer.
++//
++// Here both devices import the same block of host memory (VK_EXT_external_memory_host), one slot per device:
++//   1. each device copies its partial into its own slot, queued behind the subgraph that produced it
++//   2. submit both devices, then wait for both: the only stop
++//   3. each device copies the other device's slot into a local buffer and adds it to its partial, queued; the next
++//      subgraph runs behind it without another stop
++// Anything else (other device counts, non-F32, non-contiguous, no external_memory_host) gets nullptr/false and the
++// meta backend uses its generic all-reduce. GGML_VK_DISABLE_COMM=1 forces the generic path, for A/B races.
++
++struct ggml_vk_comm_context {
++    ggml_backend_t        backends[2] = {};
++    uint8_t *             host_alloc  = nullptr; // as returned by malloc
++    uint8_t *             host_mem    = nullptr; // aligned: slot 0 at 0, slot 1 at slot_size
++    size_t                slot_size   = 0;
++    vk_buffer             host_buf[2];           // host_mem as a buffer on each device
++    ggml_backend_buffer_t tmp_buf[2]  = {};      // on each device: where the other device's partial lands
++    ggml_tensor           node_tmp[2];
++    ggml_tensor           node_add[2];
++    ggml_context *        gctx        = nullptr; // holds the two one-node graphs
++    ggml_cgraph *         graph[2]    = {};
++};
++
++static void ggml_vk_comm_release_buffers(ggml_vk_comm_context * cc) {
++    for (int j = 0; j < 2; j++) {
++        ggml_vk_destroy_buffer(cc->host_buf[j]);
++        if (cc->tmp_buf[j] != nullptr) {
++            ggml_backend_buffer_free(cc->tmp_buf[j]);
++            cc->tmp_buf[j] = nullptr;
++        }
++    }
++    free(cc->host_alloc);
++    cc->host_alloc = nullptr;
++    cc->host_mem   = nullptr;
++    cc->slot_size  = 0;
++}
++
++// Grow the shared slots and the per-device landing buffers to hold nbytes. Both devices must be idle.
++static bool ggml_vk_comm_reserve(ggml_vk_comm_context * cc, size_t nbytes) {
++    if (nbytes <= cc->slot_size) {
++        return true;
++    }
++    ggml_vk_comm_release_buffers(cc);
++
++    size_t align = 1;
++    for (int j = 0; j < 2; j++) {
++        const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) cc->backends[j]->context;
++        align = std::max(align, (size_t) ctx->device->min_imported_host_pointer_alignment);
++    }
++    const size_t slot = GGML_PAD(nbytes, align);
++
++    cc->host_alloc = (uint8_t *) malloc(2*slot + align);
++    if (cc->host_alloc == nullptr) {
++        return false;
++    }
++    cc->host_mem = (uint8_t *) GGML_PAD((uintptr_t) cc->host_alloc, align);
++
++    for (int j = 0; j < 2; j++) {
++        ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) cc->backends[j]->context;
++        cc->host_buf[j] = ggml_vk_buffer_from_host_ptr(ctx->device, cc->host_mem, 2*slot);
++        cc->tmp_buf[j]  = ggml_backend_alloc_buffer(cc->backends[j], slot);
++        if (cc->host_buf[j] == nullptr || cc->tmp_buf[j] == nullptr) {
++            GGML_LOG_WARN("%s: could not set up %zu-byte shared slots on device %d, using the generic all-reduce\n", __func__, slot, j);
++            ggml_vk_comm_release_buffers(cc);
++            return false;
++        }
++    }
++    cc->slot_size = slot;
++    return true;
++}
++
++static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_backends) {
++    if (n_backends != 2 || getenv("GGML_VK_DISABLE_COMM") != nullptr) {
++        return nullptr;
++    }
++    for (size_t j = 0; j < n_backends; j++) {
++        if (!ggml_backend_is_vk(backends[j])) {
++            return nullptr;
++        }
++        const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backends[j]->context;
++        if (!ctx->device->external_memory_host) {
++            return nullptr;
++        }
++    }
++
++    ggml_vk_comm_context * cc = new ggml_vk_comm_context;
++    cc->backends[0] = backends[0];
++    cc->backends[1] = backends[1];
++
++    const ggml_init_params params = { 2*ggml_graph_overhead_custom(1, false), nullptr, /*no_alloc =*/ true };
++    cc->gctx = ggml_init(params);
++    for (int j = 0; j < 2; j++) {
++        cc->graph[j] = ggml_new_graph_custom(cc->gctx, 1, false);
++    }
++    return cc;
++}
++
++static void ggml_backend_vk_comm_free(void * comm_ctx) {
++    ggml_vk_comm_context * cc = (ggml_vk_comm_context *) comm_ctx;
++    if (cc == nullptr) {
++        return;
++    }
++    for (int j = 0; j < 2; j++) {
++        ggml_backend_synchronize(cc->backends[j]);
++    }
++    ggml_vk_comm_release_buffers(cc);
++    ggml_free(cc->gctx);
++    delete cc;
++}
++
++static bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tensors) {
++    ggml_vk_comm_context * cc = (ggml_vk_comm_context *) comm_ctx;
++    ggml_tensor * t[2] = { tensors[0], tensors[1] };
++
++    for (int j = 0; j < 2; j++) {
++        if (t[j]->type != GGML_TYPE_F32 || !ggml_is_contiguous(t[j]) || !ggml_backend_buffer_is_vk(t[j]->buffer)) {
++            return false;
++        }
++        if ((t[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return false; // a disabled zero-size slice: the generic path zeroes it first
++        }
++    }
++    if (ggml_nelements(t[0]) != ggml_nelements(t[1])) {
++        return false;
++    }
++    const size_t nbytes = ggml_nbytes(t[0]);
++    if (nbytes == 0) {
++        return true;
++    }
++
++    ggml_backend_vk_context * ctx[2] = {
++        (ggml_backend_vk_context *) cc->backends[0]->context,
++        (ggml_backend_vk_context *) cc->backends[1]->context,
++    };
++
++    if (nbytes > cc->slot_size) {
++        for (int j = 0; j < 2; j++) {
++            ggml_backend_synchronize(cc->backends[j]); // the old landing buffers may still be in use
++        }
++        if (!ggml_vk_comm_reserve(cc, nbytes)) {
++            return false;
++        }
++    }
++
++    // 1. each device: its partial -> its slot, queued behind the subgraph that wrote it
++    for (int j = 0; j < 2; j++) {
++        vk_context subctx = ggml_vk_get_compute_ctx(ctx[j]);
++        ggml_vk_sync_buffers(ctx[j], subctx);
++        vk_buffer src = ((ggml_backend_vk_buffer_context *) t[j]->buffer->context)->dev_buffer;
++        ggml_vk_buffer_copy_async(subctx, cc->host_buf[j], j*cc->slot_size, src, vk_tensor_offset(t[j]) + t[j]->view_offs, nbytes);
++    }
++
++    // 2. the one stop: submit both devices, then wait for both
++    vk_sync_ticket ticket[2];
++    for (int j = 0; j < 2; j++) {
++        ticket[j] = ggml_vk_synchronize_submit(ctx[j]);
++    }
++    for (int j = 0; j < 2; j++) {
++        ggml_vk_synchronize_wait(ctx[j], ticket[j]);
++        ggml_vk_graph_cleanup(ctx[j]);
++    }
++
++    // 3. each device: the other's slot -> local buffer, then partial += it; queued, no wait
++    for (int j = 0; j < 2; j++) {
++        vk_context subctx = ggml_vk_get_compute_ctx(ctx[j]);
++        vk_buffer tmp = ((ggml_backend_vk_buffer_context *) cc->tmp_buf[j]->context)->dev_buffer;
++        ggml_vk_buffer_copy_async(subctx, tmp, 0, cc->host_buf[j], (1 - j)*cc->slot_size, nbytes);
++        ggml_vk_sync_buffers(ctx[j], subctx);
++
++        ggml_tensor * node_tmp = &cc->node_tmp[j];
++        memset(node_tmp, 0, sizeof(ggml_tensor));
++        node_tmp->type = GGML_TYPE_F32;
++        for (int k = 0; k < GGML_MAX_DIMS; k++) {
++            node_tmp->ne[k] = t[j]->ne[k];
++            node_tmp->nb[k] = t[j]->nb[k];
++        }
++        node_tmp->buffer = cc->tmp_buf[j];
++        node_tmp->data   = ggml_backend_buffer_get_base(cc->tmp_buf[j]);
++
++        ggml_tensor * node_add = &cc->node_add[j];
++        memset(node_add, 0, sizeof(ggml_tensor));
++        node_add->type = GGML_TYPE_F32;
++        for (int k = 0; k < GGML_MAX_DIMS; k++) {
++            node_add->ne[k] = t[j]->ne[k];
++            node_add->nb[k] = t[j]->nb[k];
++        }
++        node_add->op        = GGML_OP_ADD;
++        node_add->src[0]    = t[j];
++        node_add->src[1]    = node_tmp;
++        node_add->view_src  = t[j]->view_src != nullptr ? t[j]->view_src : t[j];
++        node_add->view_offs = t[j]->view_offs;
++        node_add->flags    |= GGML_TENSOR_FLAG_COMPUTE;
++        ggml_backend_view_init(node_add);
++
++        cc->graph[j]->nodes[0] = node_add;
++        cc->graph[j]->n_nodes  = 1;
++        if (ggml_backend_graph_compute_async(cc->backends[j], cc->graph[j]) != GGML_STATUS_SUCCESS) {
++            GGML_ABORT("%s: add on device %d failed", __func__, j); // half done: falling back would add twice
++        }
++    }
++    return true;
++}
++
++static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_comm_init") == 0) {
++        return (void *) ggml_backend_vk_comm_init;
++    }
++    if (strcmp(name, "ggml_backend_comm_free") == 0) {
++        return (void *) ggml_backend_vk_comm_free;
++    }
++    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
++        return (void *) ggml_backend_vk_comm_allreduce_tensor;
++    }
++    return nullptr;
++}
++
+ static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
+     /* .get_name         = */ ggml_backend_vk_reg_get_name,
+     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
+     /* .get_device       = */ ggml_backend_vk_reg_get_device,
+-    /* .get_proc_address = */ NULL,
++    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
+ };
+ 
+ ggml_backend_reg_t ggml_backend_vk_reg() {
+-- 
+2.55.0.windows.3
+

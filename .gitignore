@@ -1,0 +1,4 @@
+*.gguf
+*.exe
+*.obj
+build*/

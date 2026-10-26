@@ -1,0 +1,284 @@
+From 989d1b155defbc936d82fc7252fd543e081dc641 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Sun, 25 Oct 2026 19:17:03 -0400
+Subject: [PATCH 07/12] vulkan: GGML_TYPE_Q12H - dequant shader, get_rows and a
+ fused mat-vec
+
+types.glsl gets block_q12h (412 bytes, QUANT_K 256, QUANT_R 1) and
+dequant_funcs.glsl the reconstruction: ix from the nibble pair, bits =
+(sm>>7)<<15 | lut[ix]<<7 | (sm&0x7F), f32 = bits<<16. The exception loop
+breaks on epos[s] == 0xFF exactly like dequantize_row_q12h() on the CPU, so
+the GPU and CPU agree bit for bit. get_dm returns (1,0) - Q12H has no scale.
+
+"q12h" in type_names gives the generic mul_mat_vec.comp, get_rows_quant.comp
+and the new dequant_q12h.comp (4 blocks per 256-thread workgroup). Q12H gets
+no mul_mm shader, so big matmuls take the dequant-to-f16 path via
+ggml_vk_get_to_fp16, while decode runs the fused mat-vec.
+
+test-backend-ops: GGML_TYPE_Q12H in all_types and other_types. 13 q12h
+MUL_MAT cases (n = 1..9, 64; k = 256, 4096), 2288/2288 passed on Vulkan1.
+
+Greedy output on Qwen3-1.7B, -n 64 --temp 0 --seed 1, is byte-identical
+across bf16/Vulkan1, q12h/Vulkan1, q12h/CPU, q12h/Vulkan0 and bf16/Vulkan0.
+Vulkan0 is the Intel iGPU, which oneAPI/Level-Zero cannot see at all.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 11 +++++
+ .../vulkan-shaders/dequant_funcs.glsl         | 41 +++++++++++++++++++
+ .../vulkan-shaders/dequant_q12h.comp          | 31 ++++++++++++++
+ .../src/ggml-vulkan/vulkan-shaders/types.glsl | 24 +++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  1 +
+ tests/test-backend-ops.cpp                    |  2 +
+ 6 files changed, 110 insertions(+)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 33625794e..fe3ad4260 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2994,6 +2994,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f32_f32",  arr_dmmv_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f32_f32",   OCP_DMMV_LEN(arr_dmmv_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f32_f32",   OCP_DMMV_LEN(arr_dmmv_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q12H][i],  "mul_mat_vec_q12h_f32_f32",  arr_dmmv_q12h_f32_f32_len[reduc],  arr_dmmv_q12h_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f16_f32",  arr_dmmv_f32_f16_f32_len[reduc],  arr_dmmv_f32_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+@@ -3023,6 +3024,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f16_f32",  arr_dmmv_iq4_nl_f16_f32_len[reduc16],  arr_dmmv_iq4_nl_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f16_f32",   OCP_DMMV_LEN(arr_dmmv_mxfp4_f16_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_mxfp4_f16_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f16_f32",   OCP_DMMV_LEN(arr_dmmv_nvfp4_f16_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_nvfp4_f16_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q12H][i],  "mul_mat_vec_q12h_f16_f32",  arr_dmmv_q12h_f16_f32_len[reduc],  arr_dmmv_q12h_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+ 
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+             if (device->integer_dot_product) {
+@@ -3080,6 +3082,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  arr_dmmv_id_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_id_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_MXFP4],   "mul_mat_vec_id_mxfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_NVFP4],   "mul_mat_vec_id_nvfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q12H],  "mul_mat_vec_id_q12h_f32",  arr_dmmv_id_q12h_f32_f32_len[reduc],  arr_dmmv_id_q12h_f32_f32_data[reduc],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
+ 
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         if (device->integer_dot_product) {
+@@ -3148,6 +3151,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_MXFP4],   "dequant_mxfp4",   dequant_mxfp4_len,   dequant_mxfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_NVFP4],   "dequant_nvfp4",   dequant_nvfp4_len,   dequant_nvfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q12H],    "dequant_q12h",    dequant_q12h_len,    dequant_q12h_data,    "main", 2, 5 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+ 
+     // get_rows
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
+@@ -3178,6 +3182,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ4_NL],  "get_rows_iq4_nl",  get_rows_iq4_nl_len,  get_rows_iq4_nl_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_MXFP4],   "get_rows_mxfp4",   get_rows_mxfp4_len,   get_rows_mxfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_NVFP4],   "get_rows_nvfp4",   get_rows_nvfp4_len,   get_rows_nvfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q12H],    "get_rows_q12h",    get_rows_q12h_len,    get_rows_q12h_data,    "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32],     "get_rows_i32",     get_rows_i32_len,     get_rows_i32_data,     "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F32 ], "get_rows_f32_f32",  get_rows_f32_f32_len,  get_rows_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
+@@ -3208,6 +3213,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_IQ4_NL],  "get_rows_iq4_nl_f32",  get_rows_iq4_nl_f32_len,  get_rows_iq4_nl_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_MXFP4],   "get_rows_mxfp4_f32",   get_rows_mxfp4_f32_len,   get_rows_mxfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_NVFP4],   "get_rows_nvfp4_f32",   get_rows_nvfp4_f32_len,   get_rows_nvfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q12H],    "get_rows_q12h_f32",    get_rows_q12h_f32_len,    get_rows_q12h_f32_data,    "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+@@ -5586,6 +5592,7 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
+         case GGML_TYPE_NVFP4:
+         case GGML_TYPE_TQ1_0:
+         case GGML_TYPE_TQ2_0:
++        case GGML_TYPE_Q12H:
+             break;
+         default:
+             return nullptr;
+@@ -5651,6 +5658,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         case GGML_TYPE_NVFP4:
+         case GGML_TYPE_TQ1_0:
+         case GGML_TYPE_TQ2_0:
++        case GGML_TYPE_Q12H:
+             break;
+         default:
+             return nullptr;
+@@ -5739,6 +5747,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+         case GGML_TYPE_NVFP4:
+         case GGML_TYPE_TQ1_0:
+         case GGML_TYPE_TQ2_0:
++        case GGML_TYPE_Q12H:
+             break;
+         default:
+             return nullptr;
+@@ -15666,6 +15675,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_NVFP4:
+                     case GGML_TYPE_TQ1_0:
+                     case GGML_TYPE_TQ2_0:
++                    case GGML_TYPE_Q12H:
+                         break;
+                     default:
+                         return false;
+@@ -15777,6 +15787,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_NVFP4:
+                     case GGML_TYPE_TQ1_0:
+                     case GGML_TYPE_TQ2_0:
++                    case GGML_TYPE_Q12H:
+                     case GGML_TYPE_I32:
+                         return true;
+                     default:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index 911ceac22..560a68bd1 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -544,6 +544,47 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+ }
+ #endif
+ 
++#if defined(DATA_A_Q12H)
++// Rebuild one bf16 bit pattern out of the block. The <=4 exception slots are filled in
++// order and 0xFF terminates the list, so the loop breaks there exactly like
++// dequantize_row_q12h() on the CPU does.
++uint q12h_bits(uint ibi, uint j) {
++    const uint sm = uint(data_a[ibi].sm[j]);
++    const uint nb = uint(data_a[ibi].nib[j >> 1]);
++    const uint ix = ((j & 1) != 0) ? (nb >> 4) : (nb & 0xF);
++    uint bits = ((sm >> 7) << 15) | (uint(data_a[ibi].lut[ix]) << 7) | (sm & 0x7F);
++    for (uint s = 0; s < 4; ++s) {
++        const uint p = uint(data_a[ibi].epos[s]);
++        if (p == 0xFF) {
++            break;
++        }
++        if (p == j) {
++            bits = uint(data_a[ibi].eval[s]);
++        }
++    }
++    return bits;
++}
++// bf16 -> f32 is a 16-bit left shift
++float q12h_dequant1(uint ibi, uint j) {
++    return uintBitsToFloat(q12h_bits(ibi, j) << 16);
++}
++FLOAT_TYPE dequantize1(uint ib, uint iqs, uint a_offset) {
++    return FLOAT_TYPE(q12h_dequant1(a_offset + ib, iqs));
++}
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    const uint ibi = a_offset + ib;
++    return vec2(q12h_dequant1(ibi, iqs), q12h_dequant1(ibi, iqs + 1));
++}
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    const uint ibi = a_offset + ib;
++    return vec4(q12h_dequant1(ibi, iqs    ), q12h_dequant1(ibi, iqs + 1),
++                q12h_dequant1(ibi, iqs + 2), q12h_dequant1(ibi, iqs + 3));
++}
++vec2 get_dm(uint ib, uint a_offset) {
++    return vec2(1.0, 0.0);
++}
++#endif
++
+ #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
+ vec2 get_dm(uint ib, uint a_offset) {
+     return vec2(0, 0);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+new file mode 100644
+index 000000000..8ccca22fb
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+@@ -0,0 +1,31 @@
++#version 450
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {block_q12h data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
++
++#include "dequant_funcs.glsl"
++
++void main() {
++    // One workgroup of 256 threads covers 4 blocks of 256 weights:
++    // 64 threads per block, 4 weights each.
++    const uint ib  = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
++    const uint tid = gl_LocalInvocationID.x % 64;
++
++    if (ib >= p.nel / QUANT_K) {
++        return;
++    }
++
++    const uint j     = 4 * tid;
++    const uint b_idx = ib * QUANT_K + j;
++
++    const vec4 v = dequantize4(ib, j, 0);
++
++    data_b[b_idx    ] = D_TYPE(v.x);
++    data_b[b_idx + 1] = D_TYPE(v.y);
++    data_b[b_idx + 2] = D_TYPE(v.z);
++    data_b[b_idx + 3] = D_TYPE(v.w);
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index ec0a80c7e..bc02cbfd0 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1870,6 +1870,30 @@ struct block_nvfp4_packed32
+ #define A_TYPE_PACKED32 block_nvfp4_packed32
+ #endif
+ 
++// Q12H: lossless 12.875-bit storage for bf16 weights. 256 weights / 412 bytes.
++// lut[16]  - the block's 16 most frequent bf16 exponent bytes
++// epos[4]  - exception positions (0..255), 0xFF = empty slot (and all later slots empty)
++// eval[4]  - exception values, raw bf16 bit patterns
++// nib[128] - 4-bit lut indices, two per byte, EVEN index in the LOW nibble
++// sm[256]  - sign(1) << 7 | mantissa(7)
++#define QUANT_K_Q12H 256
++#define QUANT_R_Q12H 1
++
++struct block_q12h
++{
++    uint8_t  lut[16];
++    uint8_t  epos[4];
++    uint16_t eval[4];
++    uint8_t  nib[QUANT_K_Q12H/2];
++    uint8_t  sm[QUANT_K_Q12H];
++};
++
++#if defined(DATA_A_Q12H)
++#define QUANT_K QUANT_K_Q12H
++#define QUANT_R QUANT_R_Q12H
++#define A_TYPE block_q12h
++#endif
++
+ #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+ const int8_t kvalues_iq4nl_const[16] = {
+     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index f54501546..e24d241da 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -74,6 +74,7 @@ const std::vector<std::string> type_names = {
+     "nvfp4",
+     "tq1_0",
+     "tq2_0",
++    "q12h",
+     "bf16",
+ };
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fe3a67c64..e5674cffc 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9954,6 +9954,7 @@ static const ggml_type all_types[] = {
+     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
++    GGML_TYPE_Q12H,
+ };
+ 
+ static const ggml_type base_types[] = {
+@@ -9983,6 +9984,7 @@ static const ggml_type other_types[] = {
+     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+     GGML_TYPE_BF16,
++    GGML_TYPE_Q12H,
+ };
+ 
+ #ifdef _MSC_VER
+-- 
+2.55.0.windows.3
+

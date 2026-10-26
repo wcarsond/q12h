@@ -1,0 +1,8 @@
+file                lut[0]=FF blk phase  epos conf  call
+1.7B v1 (known)         0.00%        12    100.00%  v1  (expected v1)
+1.7B v2 (known)        98.65%        12    100.00%  v2  (expected v2)
+
+calibration OK: the probe separates known v1 from known v2.
+
+7B as-built            98.56%       140    100.00%  v2
+7B 2nd output          98.56%       140    100.00%  v2

@@ -1,0 +1,382 @@
+From 327fa6d2fc5c54a370c781a844ec9d03146a69e0 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Thu, 1 Oct 2026 00:42:02 -0400
+Subject: [PATCH 02/12] vulkan : two-device all-reduce without a CPU stop
+ (relay thread)
+
+The one-stop all-reduce still drained both devices once per exchange. Now each
+device signals a timeline semaphore of its own when its slot is written and
+when it has read the other's slot, and the other device waits in-queue on a
+mirror semaphore; a relay thread polls the source counters and host-signals
+the mirrors. The main thread never waits and neither device drains. Host slots
+are a ring sized from a 64 MB per-device budget (2..256 slots); the "read"
+signals guard reuse, so any depth >= 2 is correct. A failed reservation is
+remembered rather than retried every exchange.
+
+Vulkan's external semaphores would do this without the thread, and the Intel
+Windows driver reports them exportable and importable for timeline semaphores,
+but an import between the two physical devices succeeds and shares nothing:
+host and queue signals on one device are never seen on the other (probe in
+llama.cpp-b60/vk-semaphore-probe). GGML_VK_COMM_SYNC=1 keeps the one-stop
+path for A/B.
+
+Measured on two Arc Pro B60s, Windows 11, vs one card (tg128 / pp512):
+  granite 30B dense     one-stop 1.11x / 1.47x -> no-stop 1.24x / 1.49x
+  qwen2.5-coder 14B     one-stop 0.92x / 1.25x -> no-stop 1.03x / 1.26x
+  qwen3 30B-A3B MoE     one-stop 0.49x / 1.20x -> no-stop 0.63x / 1.23x
+Output is byte-identical to the generic path on a 500-token greedy completion.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 229 ++++++++++++++++++++++++---
+ 1 file changed, 208 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index cc65699c7..083b68ca8 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1,5 +1,14 @@
+ #include "ggml-vulkan-common.h"
+ 
++// for the two-device all-reduce's relay thread
++#include <atomic>
++#include <thread>
++
++namespace {
++inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
++    return os << static_cast<VkBuffer>(buffer);
++}
++}
+ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
+     vk::PhysicalDeviceProperties props = device.getProperties();
+ 
+@@ -4462,7 +4471,6 @@ vk_device ggml_vk_get_device(size_t idx) {
+         if (device->external_memory_host) {
+             device_extensions.push_back("VK_EXT_external_memory_host");
+         }
+-
+ #if defined(VK_EXT_shader_64bit_indexing)
+         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
+         shader_64bit_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_64_BIT_INDEXING_FEATURES_EXT;
+@@ -16347,18 +16355,30 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
+ // per exchange: synchronize both, read one partial back to the CPU, write it to the other device, and the same the
+ // other way. Measured on two Arc Pro B60s (Windows): ~190 us per exchange, two exchanges per layer.
+ //
+-// Here both devices import the same block of host memory (VK_EXT_external_memory_host), one slot per device:
++// Here both devices import the same block of host memory (VK_EXT_external_memory_host), a ring of slots per device:
+ //   1. each device copies its partial into its own slot, queued behind the subgraph that produced it
+-//   2. submit both devices, then wait for both: the only stop
++//   2. submit both devices
+ //   3. each device copies the other device's slot into a local buffer and adds it to its partial, queued; the next
+-//      subgraph runs behind it without another stop
++//      subgraph runs behind it
++// Two modes, chosen at init:
++//   async: each device signals a timeline semaphore of its own when its slot is written ("written") and when it has
++//          read the other's slot ("read"); the other device waits in-queue on a mirror semaphore of its own. A relay
++//          thread polls the source counters and host-signals the mirrors, so the main thread never waits and
++//          neither device drains. (Vulkan's external semaphores would do this without the thread, but on the Intel
++//          Windows driver an import between two physical devices succeeds and shares nothing; see vk-semaphore-probe.)
++//          "read" keeps the ring from being overwritten before it has been read.
++//   sync:  GGML_VK_COMM_SYNC=1, or the device serializes submissions: step 2 is one submit + wait on both devices.
+ // Anything else (other device counts, non-F32, non-contiguous, no external_memory_host) gets nullptr/false and the
+ // meta backend uses its generic all-reduce. GGML_VK_DISABLE_COMM=1 forces the generic path, for A/B races.
+ 
+ struct ggml_vk_comm_context {
+     ggml_backend_t        backends[2] = {};
++    bool                  async       = false;
++    int                   n_slots     = 1;       // ring depth per device (async, set by reserve), 1 in sync mode
++    size_t                failed_bytes = 0;      // smallest tensor size whose slots could not be set up (0: none)
++    uint64_t              seq         = 0;       // exchanges so far; the semaphore value of the current one
+     uint8_t *             host_alloc  = nullptr; // as returned by malloc
+-    uint8_t *             host_mem    = nullptr; // aligned: slot 0 at 0, slot 1 at slot_size
++    uint8_t *             host_mem    = nullptr; // aligned; device j's slot k at (j*n_slots + k)*slot_size
+     size_t                slot_size   = 0;
+     vk_buffer             host_buf[2];           // host_mem as a buffer on each device
+     ggml_backend_buffer_t tmp_buf[2]  = {};      // on each device: where the other device's partial lands
+@@ -16366,6 +16386,17 @@ struct ggml_vk_comm_context {
+     ggml_tensor           node_add[2];
+     ggml_context *        gctx        = nullptr; // holds the two one-node graphs
+     ggml_cgraph *         graph[2]    = {};
++    // async: sem_written[j][j] is signalled by device j's queue when its slot holds exchange seq; sem_written[j][1-j]
++    // is the mirror on the other device, host-signalled by the relay thread, that device 1-j's queue waits on.
++    // sem_read likewise for "device j has read the other's slot of exchange seq".
++    vk::Semaphore         sem_written[2][2];
++    vk::Semaphore         sem_read[2][2];
++    std::thread           relay;
++    std::atomic<bool>     relay_stop { false };
++    PFN_vkGetSemaphoreCounterValue pfn_counter[2] = {}; // per device
++    PFN_vkSignalSemaphore          pfn_signal[2]  = {};
++
++    size_t slot_offset(int j, uint64_t s) const { return (j*n_slots + (size_t) (s % n_slots)) * slot_size; }
+ };
+ 
+ static void ggml_vk_comm_release_buffers(ggml_vk_comm_context * cc) {
+@@ -16383,10 +16414,16 @@ static void ggml_vk_comm_release_buffers(ggml_vk_comm_context * cc) {
+ }
+ 
+ // Grow the shared slots and the per-device landing buffers to hold nbytes. Both devices must be idle.
++// The ring is as deep as a 64 MB per-device budget allows, between 2 and 256 slots: during prompt processing a slot
++// is megabytes (then a few slots, each exchange taking long enough that the ring never stalls), during generation
++// it is kilobytes (then 256). Any depth >= 2 is correct; the "read" signals guard reuse.
+ static bool ggml_vk_comm_reserve(ggml_vk_comm_context * cc, size_t nbytes) {
+     if (nbytes <= cc->slot_size) {
+         return true;
+     }
++    if (cc->failed_bytes != 0 && nbytes >= cc->failed_bytes) {
++        return false; // already failed at this size; do not retry every exchange
++    }
+     ggml_vk_comm_release_buffers(cc);
+ 
+     size_t align = 1;
+@@ -16395,8 +16432,13 @@ static bool ggml_vk_comm_reserve(ggml_vk_comm_context * cc, size_t nbytes) {
+         align = std::max(align, (size_t) ctx->device->min_imported_host_pointer_alignment);
+     }
+     const size_t slot = GGML_PAD(nbytes, align);
++    if (cc->async) {
++        const size_t budget = 64u * 1024 * 1024;
++        cc->n_slots = (int) std::max<size_t>(2, std::min<size_t>(256, budget / slot));
++    }
+ 
+-    cc->host_alloc = (uint8_t *) malloc(2*slot + align);
++    const size_t host_size = 2*cc->n_slots*slot;
++    cc->host_alloc = (uint8_t *) malloc(host_size + align);
+     if (cc->host_alloc == nullptr) {
+         return false;
+     }
+@@ -16404,11 +16446,12 @@ static bool ggml_vk_comm_reserve(ggml_vk_comm_context * cc, size_t nbytes) {
+ 
+     for (int j = 0; j < 2; j++) {
+         ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) cc->backends[j]->context;
+-        cc->host_buf[j] = ggml_vk_buffer_from_host_ptr(ctx->device, cc->host_mem, 2*slot);
++        cc->host_buf[j] = ggml_vk_buffer_from_host_ptr(ctx->device, cc->host_mem, host_size);
+         cc->tmp_buf[j]  = ggml_backend_alloc_buffer(cc->backends[j], slot);
+         if (cc->host_buf[j] == nullptr || cc->tmp_buf[j] == nullptr) {
+-            GGML_LOG_WARN("%s: could not set up %zu-byte shared slots on device %d, using the generic all-reduce\n", __func__, slot, j);
++            GGML_LOG_WARN("%s: could not set up %d x %zu-byte shared slots on device %d, using the generic all-reduce for tensors this size\n", __func__, cc->n_slots, slot, j);
+             ggml_vk_comm_release_buffers(cc);
++            cc->failed_bytes = nbytes;
+             return false;
+         }
+     }
+@@ -16416,10 +16459,88 @@ static bool ggml_vk_comm_reserve(ggml_vk_comm_context * cc, size_t nbytes) {
+     return true;
+ }
+ 
++// A timeline semaphore on device `owner` (signalled by its queue) and its mirror on the other device (host-signalled
++// by the relay thread, waited on by that device's queue). Both start at 0.
++static bool ggml_vk_comm_make_pair(ggml_vk_comm_context * cc, int owner, vk::Semaphore out[2]) {
++    for (int d = 0; d < 2; d++) {
++        vk::Device dev = ((ggml_backend_vk_context *) cc->backends[d]->context)->device->device;
++        vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
++        vk::SemaphoreCreateInfo ci{};
++        ci.setPNext(&tci);
++        try {
++            out[d] = dev.createSemaphore(ci);
++        } catch (const vk::SystemError &) {
++            return false;
++        }
++    }
++    GGML_UNUSED(owner);
++    return true;
++}
++
++// The relay: whenever a device's "written" or "read" counter advances, host-signal the mirror on the other device.
++// Spins on one core; the counter reads are a few microseconds each.
++static void ggml_vk_comm_relay(ggml_vk_comm_context * cc) {
++    struct link {
++        VkDevice    src_dev;
++        VkSemaphore src;
++        int         dst;     // device index of the mirror
++        VkSemaphore mirror;
++        uint64_t    last;
++    };
++    link links[4];
++    int n = 0;
++    for (int j = 0; j < 2; j++) {
++        VkDevice dev_j = static_cast<VkDevice>(((ggml_backend_vk_context *) cc->backends[j]->context)->device->device);
++        links[n++] = { dev_j, cc->sem_written[j][j], 1 - j, cc->sem_written[j][1 - j], 0 };
++        links[n++] = { dev_j, cc->sem_read[j][j],    1 - j, cc->sem_read[j][1 - j],    0 };
++    }
++    VkDevice dst_dev[2];
++    for (int d = 0; d < 2; d++) {
++        dst_dev[d] = static_cast<VkDevice>(((ggml_backend_vk_context *) cc->backends[d]->context)->device->device);
++    }
++
++    int idle = 0;
++    while (!cc->relay_stop.load(std::memory_order_relaxed)) {
++        bool advanced = false;
++        for (link & l : links) {
++            uint64_t v = 0;
++            const int src = (l.dst == 1) ? 0 : 1;
++            if (cc->pfn_counter[src](l.src_dev, l.src, &v) == VK_SUCCESS && v > l.last) {
++                VkSemaphoreSignalInfo si = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, l.mirror, v };
++                cc->pfn_signal[l.dst](dst_dev[l.dst], &si);
++                l.last   = v;
++                advanced = true;
++            }
++        }
++        if (advanced) {
++            idle = 0;
++        } else if (++idle > 2000) {
++            std::this_thread::yield(); // nothing moving (between tokens, or the model is loading): give the core up
++        }
++    }
++}
++
++static void ggml_vk_comm_destroy_semaphores(ggml_vk_comm_context * cc) {
++    for (int j = 0; j < 2; j++) {
++        for (int d = 0; d < 2; d++) {
++            vk::Device dev = ((ggml_backend_vk_context *) cc->backends[d]->context)->device->device;
++            if (cc->sem_written[j][d]) {
++                dev.destroySemaphore(cc->sem_written[j][d]);
++                cc->sem_written[j][d] = nullptr;
++            }
++            if (cc->sem_read[j][d]) {
++                dev.destroySemaphore(cc->sem_read[j][d]);
++                cc->sem_read[j][d] = nullptr;
++            }
++        }
++    }
++}
++
+ static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_backends) {
+     if (n_backends != 2 || getenv("GGML_VK_DISABLE_COMM") != nullptr) {
+         return nullptr;
+     }
++    bool can_async = getenv("GGML_VK_COMM_SYNC") == nullptr;
+     for (size_t j = 0; j < n_backends; j++) {
+         if (!ggml_backend_is_vk(backends[j])) {
+             return nullptr;
+@@ -16428,12 +16549,41 @@ static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_back
+         if (!ctx->device->external_memory_host) {
+             return nullptr;
+         }
++        if (ctx->device->serialize_submissions) {
++            can_async = false;
++        }
+     }
+ 
+     ggml_vk_comm_context * cc = new ggml_vk_comm_context;
+     cc->backends[0] = backends[0];
+     cc->backends[1] = backends[1];
+ 
++    if (can_async) {
++        cc->async = true;
++        for (int d = 0; d < 2 && cc->async; d++) {
++            VkDevice dev = static_cast<VkDevice>(((ggml_backend_vk_context *) backends[d]->context)->device->device);
++            cc->pfn_counter[d] = (PFN_vkGetSemaphoreCounterValue) vkGetDeviceProcAddr(dev, "vkGetSemaphoreCounterValue");
++            cc->pfn_signal[d]  = (PFN_vkSignalSemaphore)          vkGetDeviceProcAddr(dev, "vkSignalSemaphore");
++            if (cc->pfn_counter[d] == nullptr) {
++                cc->pfn_counter[d] = (PFN_vkGetSemaphoreCounterValue) vkGetDeviceProcAddr(dev, "vkGetSemaphoreCounterValueKHR");
++            }
++            if (cc->pfn_signal[d] == nullptr) {
++                cc->pfn_signal[d] = (PFN_vkSignalSemaphore) vkGetDeviceProcAddr(dev, "vkSignalSemaphoreKHR");
++            }
++            cc->async = cc->pfn_counter[d] != nullptr && cc->pfn_signal[d] != nullptr;
++        }
++        for (int j = 0; j < 2 && cc->async; j++) {
++            cc->async = ggml_vk_comm_make_pair(cc, j, cc->sem_written[j]) && ggml_vk_comm_make_pair(cc, j, cc->sem_read[j]);
++        }
++        if (cc->async) {
++            cc->relay = std::thread(ggml_vk_comm_relay, cc);
++        } else {
++            GGML_LOG_WARN("%s: no timeline semaphore host signalling; all-reduce will stop the CPU once per exchange\n", __func__);
++            ggml_vk_comm_destroy_semaphores(cc);
++        }
++    }
++    cc->n_slots = cc->async ? 256 : 1; // 256: more exchanges than a token has layers, so the ring never waits
++
+     const ggml_init_params params = { 2*ggml_graph_overhead_custom(1, false), nullptr, /*no_alloc =*/ true };
+     cc->gctx = ggml_init(params);
+     for (int j = 0; j < 2; j++) {
+@@ -16448,9 +16598,14 @@ static void ggml_backend_vk_comm_free(void * comm_ctx) {
+         return;
+     }
+     for (int j = 0; j < 2; j++) {
+-        ggml_backend_synchronize(cc->backends[j]);
++        ggml_backend_synchronize(cc->backends[j]); // needs the relay alive: queued waits are satisfied through it
++    }
++    if (cc->relay.joinable()) {
++        cc->relay_stop.store(true);
++        cc->relay.join();
+     }
+     ggml_vk_comm_release_buffers(cc);
++    ggml_vk_comm_destroy_semaphores(cc);
+     ggml_free(cc->gctx);
+     delete cc;
+ }
+@@ -16489,29 +16644,61 @@ static bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor *
+         }
+     }
+ 
+-    // 1. each device: its partial -> its slot, queued behind the subgraph that wrote it
++    const uint64_t seq = ++cc->seq;
++
++    // 1. each device: its partial -> its slot, queued behind the subgraph that wrote it. async: this submission
++    //    signals "written" = seq, and (once the ring has wrapped) first waits for the other device to have read
++    //    what was in this slot last time round
+     for (int j = 0; j < 2; j++) {
+         vk_context subctx = ggml_vk_get_compute_ctx(ctx[j]);
++        if (cc->async && seq > (uint64_t) cc->n_slots) {
++            subctx->s->wait_semaphores.push_back({ cc->sem_read[1 - j][j], seq - cc->n_slots });
++        }
+         ggml_vk_sync_buffers(ctx[j], subctx);
+         vk_buffer src = ((ggml_backend_vk_buffer_context *) t[j]->buffer->context)->dev_buffer;
+-        ggml_vk_buffer_copy_async(subctx, cc->host_buf[j], j*cc->slot_size, src, vk_tensor_offset(t[j]) + t[j]->view_offs, nbytes);
++        ggml_vk_buffer_copy_async(subctx, cc->host_buf[j], cc->slot_offset(j, seq), src, vk_tensor_offset(t[j]) + t[j]->view_offs, nbytes);
++        if (cc->async) {
++            subctx->s->signal_semaphores.push_back({ cc->sem_written[j][j], seq });
++        }
+     }
+ 
+-    // 2. the one stop: submit both devices, then wait for both
+-    vk_sync_ticket ticket[2];
+-    for (int j = 0; j < 2; j++) {
+-        ticket[j] = ggml_vk_synchronize_submit(ctx[j]);
+-    }
+-    for (int j = 0; j < 2; j++) {
+-        ggml_vk_synchronize_wait(ctx[j], ticket[j]);
+-        ggml_vk_graph_cleanup(ctx[j]);
++    // 2. submit both devices. sync: then wait for both (the one stop). async: no wait
++    if (cc->async) {
++        for (int j = 0; j < 2; j++) {
++            if (ggml_vk_submit_transfer_ctx(ctx[j])) {
++                ctx[j]->submit_pending = true;
++            }
++            vk_context subctx = ctx[j]->compute_ctx.lock();
++            ggml_vk_ctx_end(subctx);
++            for (auto & cpy : subctx->in_memcpys) {
++                memcpy(cpy.dst, cpy.src, cpy.n);
++            }
++            GGML_ASSERT(subctx->out_memcpys.empty()); // host reads are only queued around a synchronize
++            ggml_vk_submit(subctx, {});
++            ctx[j]->submit_pending = true;
++            ctx[j]->compute_ctx.reset();
++        }
++    } else {
++        vk_sync_ticket ticket[2];
++        for (int j = 0; j < 2; j++) {
++            ticket[j] = ggml_vk_synchronize_submit(ctx[j]);
++        }
++        for (int j = 0; j < 2; j++) {
++            ggml_vk_synchronize_wait(ctx[j], ticket[j]);
++            ggml_vk_graph_cleanup(ctx[j]);
++        }
+     }
+ 
+-    // 3. each device: the other's slot -> local buffer, then partial += it; queued, no wait
++    // 3. each device: the other's slot -> local buffer, then partial += it; queued. async: this submission waits
++    //    in-queue for the other device's "written" = seq and signals "read" = seq when done
+     for (int j = 0; j < 2; j++) {
+         vk_context subctx = ggml_vk_get_compute_ctx(ctx[j]);
++        if (cc->async) {
++            subctx->s->wait_semaphores.push_back({ cc->sem_written[1 - j][j], seq });
++            subctx->s->signal_semaphores.push_back({ cc->sem_read[j][j], seq });
++        }
+         vk_buffer tmp = ((ggml_backend_vk_buffer_context *) cc->tmp_buf[j]->context)->dev_buffer;
+-        ggml_vk_buffer_copy_async(subctx, tmp, 0, cc->host_buf[j], (1 - j)*cc->slot_size, nbytes);
++        ggml_vk_buffer_copy_async(subctx, tmp, 0, cc->host_buf[j], cc->slot_offset(1 - j, seq), nbytes);
+         ggml_vk_sync_buffers(ctx[j], subctx);
+ 
+         ggml_tensor * node_tmp = &cc->node_tmp[j];
+-- 
+2.55.0.windows.3
+

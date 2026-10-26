@@ -1,0 +1,14 @@
+model                   layers    kvH headdim  kvLyr native ctx   KV at 1M ctx (f16 / q8 / q4)
+----------------------------------------------------------------------------------------------------------------------
+qwen3.8-flash-next          48      2     256     12    262144     22.9 /   11.4 /    5.7 GB   [compress_ratios]
+                         weights 84 GB -> -35.2 GB left of 48.8:  f16 no,  q8 no,  q4 no
+qwen3-coder-next            48      2     256     12    262144     22.9 /   11.4 /    5.7 GB   [full_attn_interval=4]
+                         weights 47 GB -> 1.8 GB left of 48.8:  f16 no,  q8 no,  q4 no
+qwen3-next-80b              48      2     256     48    262144     91.6 /   45.8 /   22.9 GB   [dense]
+                         weights 40 GB -> 8.8 GB left of 48.8:  f16 no,  q8 no,  q4 no
+qwen36-35b-a3b              40      2     256     10    262144     19.1 /    9.5 /    4.8 GB   [full_attn_interval=4]
+                         weights 17 GB -> 31.8 GB left of 48.8:  f16 FITS,  q8 FITS,  q4 FITS
+qwen3.6-27b (dense)         64      4     256     16    262144     61.0 /   30.5 /   15.3 GB   [full_attn_interval=4]
+                         weights 18 GB -> 30.8 GB left of 48.8:  f16 no,  q8 FITS,  q4 FITS
+granite42-30b               64      8     128     64    131072    244.1 /  122.1 /   61.0 GB   [dense]
+                         weights 17 GB -> 31.8 GB left of 48.8:  f16 no,  q8 no,  q4 no

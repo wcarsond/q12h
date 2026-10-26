@@ -1,0 +1,6 @@
+Vulkan1  bf16     PPL = 9.4444
+Vulkan1  q12h     PPL = 9.4445
+Vulkan1  q12h-v2  PPL = 9.4445
+Vulkan0  bf16     PPL = 9.4421
+Vulkan0  q12h     PPL = 9.4435
+Vulkan0  q12h-v2  PPL = 9.4435

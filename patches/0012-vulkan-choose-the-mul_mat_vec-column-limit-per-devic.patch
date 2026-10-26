@@ -1,0 +1,165 @@
+From 439f3726f0ef225513f469be08ae3234cfb766c3 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Sun, 25 Oct 2026 23:37:17 -0400
+Subject: [PATCH 12/12] vulkan: choose the mul_mat_vec column limit per device
+
+mul_mat_vec_max_cols was one compile-time 8 shared by every device. It decides
+where mul_mat stops using the gemv path and switches to the tiled GEMM, so on
+hardware whose gemv keeps scaling past 8 columns it caps token-generation
+throughput as soon as more than 8 sequences are in flight - the common case for
+a server holding several sessions.
+
+The right value is not just device-specific, it is inverted between vendors.
+Moving the batch across the switch with a single sequence:
+
+  Arc Pro B60 (Xe2, KHR_coopmat)    -ub 8  2151 t/s
+                                    -ub 9   579 t/s
+  RTX 3070 (Turing+, NV_coopmat2)   -ub 8/9/12/16  235 / 251 / 325 / 429 t/s
+
+On the Arc the GEMM path is 3.7x slower than the gemv path it replaces, and
+sweeping the limit puts the optimum at 32 (64 is worse again). On the NVIDIA
+part there is no cliff at all - crossing into the GEMM path gains throughput,
+and raising the limit to 16 instead regresses the 9..16 range hard: 0.42x for
+Q4_K and 0.34x for bf16. Its best value stays 8 for Q4_K; for bf16 the measured
+optimum is 6-7, so 8 is already slightly high there and must not be raised.
+The same Arc silicon under SYCL shows no cliff either, so this is a dispatch
+heuristic rather than a hardware limit.
+
+mul_mat_vec_max_cols stays, now as the capacity of the pipeline arrays, and the
+value a device dispatches with becomes vk_device_struct::mmv_max_cols. Pipelines
+are created only up to that value, so a device left at 8 compiles exactly the
+shaders it compiled before; raising the array bound costs pointers, not shader
+compilation. Only Intel parts with cooperative-matrix support are raised, which
+is the configuration the 32 was measured on - every other device keeps today's
+behaviour rather than inheriting a number nobody measured on it.
+
+One use is left on the array bound: vk_perf_logger::get_node_fusion_name has no
+device in scope and only builds a display string, so on a device below the bound
+an op can be labelled _VEC in the perf log while running on the GEMM path.
+Threading a device into the logger for a label did not seem worth the churn.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h | 13 +++++++-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp     | 41 +++++++++++++++++++++---
+ 2 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 4e4224bc0..44e916c3c 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -359,7 +359,12 @@ struct vk_queue {
+     bool transfer_only;
+ };
+ 
+-static constexpr uint32_t mul_mat_vec_max_cols = 8;
++// Capacity of the mul_mat_vec pipeline arrays below: the largest number of
++// columns ANY device may select. This is only an array bound - the value a given
++// device actually uses is per-device, in vk_device_struct::mmv_max_cols, and
++// pipelines are created only up to that value, so raising this bound does not
++// cost shader compilation on a device that does not use the extra columns.
++static constexpr uint32_t mul_mat_vec_max_cols = 32;
+ 
+ static constexpr uint32_t p021_max_gqa_ratio = 8;
+ 
+@@ -688,6 +693,12 @@ struct vk_device_struct {
+     uint32_t vendor_id;
+     vk::DriverId driver_id;
+     vk_device_architecture architecture;
++
++    // How many columns the mul_mat_vec (gemv) path handles before mul_mat falls
++    // back to the tiled GEMM. Capability-dependent, so it is per-device rather
++    // than the single compile-time constant it used to be; set in
++    // ggml_vk_load_shaders, bounded by mul_mat_vec_max_cols.
++    uint32_t mmv_max_cols = 8;
+     std::unique_ptr<vk_queue> compute_queue;
+     std::unique_ptr<vk_queue> transfer_queue;
+     bool single_queue;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 343854446..2c5468acd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2929,6 +2929,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     };
+     uint32_t rm_iq = 2 * rm_kq;
+ 
++    // How many columns stay on the gemv path before mul_mat switches to the tiled
++    // GEMM. This was a single compile-time 8 for every device, which costs a lot
++    // of token-generation throughput above 8 concurrent sequences on hardware
++    // whose gemv keeps scaling past that point.
++    //
++    // Measured, one sequence, isolating the switch with -ub 8 vs -ub 9:
++    //   Arc Pro B60 (Xe2, KHR_coopmat)   2151 t/s -> 579 t/s at the 8->9 step,
++    //                                    i.e. the GEMM path is 3.7x SLOWER here;
++    //                                    sweeping the limit, 32 is the optimum
++    //                                    and 64 is worse again.
++    //   RTX 3070 (Turing+, NV_coopmat2)  already regresses at 16, so 8 is right.
++    //   Intel iGPU (no matrix cores)     not swept; left at 8.
++    // SYCL on the same Arc silicon shows no such cliff, so this is a dispatch
++    // heuristic rather than a hardware limit.
++    //
++    // Only Intel parts WITH cooperative-matrix support are raised: that is the
++    // configuration the 32 was measured on. Every other device keeps the previous
++    // behaviour, so this cannot regress a device nobody has measured.
++    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
++        device->mmv_max_cols = 32;
++    } else {
++        device->mmv_max_cols = 8;
++    }
++    GGML_ASSERT(device->mmv_max_cols >= 1 && device->mmv_max_cols <= mul_mat_vec_max_cols);
++
+     const bool use_subgroups = device->subgroup_arithmetic;
+     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
+     // shaders that require a subgroup size >= 16; fall back to shared-memory reduction.
+@@ -2965,7 +2990,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                                               (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
+                                               SHADER_REDUCTION_MODE_SHMEM;
+ 
+-        for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
++        // only up to what this device will actually dispatch, so a device left at
++        // 8 compiles exactly the shaders it compiled before this change
++        for (uint32_t i = 0; i < device->mmv_max_cols; ++i) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+@@ -5604,7 +5631,7 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
+ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
+     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
+     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
+-    GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
++    GGML_ASSERT(num_cols >= 1 && num_cols <= ctx->device->mmv_max_cols);
+ 
+     if (b_type == GGML_TYPE_Q8_1) {
+         switch (a_type) {
+@@ -7436,7 +7463,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
+     } else if (ctx->num_additional_fused_ops == 0 &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16 || ggml_is_quantized(src1->type)) &&
+-               dst->ne[0] == 1 && dst->ne[1] > mul_mat_vec_max_cols &&
++               dst->ne[0] == 1 && dst->ne[1] > ctx->device->mmv_max_cols &&
+                src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+@@ -7444,7 +7471,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
+     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
+     // when ne12 and ne13 are one.
+-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
++    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ctx->device->mmv_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+@@ -17241,6 +17268,12 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
+         const uint64_t k     = node->src[1]->ne[0];
+         const uint64_t batch = node->ne[2] * node->ne[3];
+         std::string    name  = ggml_op_name(node->op);
++        // NOTE: this is the perf log's display label, not a dispatch decision, and
++        // this method has no device in scope - so it uses the array bound rather
++        // than the per-device mmv_max_cols. On a device that selected a lower
++        // limit, an op with n between that limit and the bound is labelled _VEC
++        // here while actually running on the GEMM path. Threading a device in
++        // would change vk_perf_logger's signature for a logging string.
+         if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols) ||
+             (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1)) {
+             name += "_VEC";
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,48 @@
+From b389f8feb7655d6cbb1a6fe25d7312dee2f5a494 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Sun, 25 Oct 2026 22:16:25 -0400
+Subject: [PATCH 11/12] vulkan: force f32 accumulation for q12h in the dequant
+ matmul path
+
+Q12H's dequant path presents src0_type = F16, so ggml_vk_get_mul_mat_mat_f16acc
+returns true and the wide GEMM accumulates thousands of products per output in
+half precision. bf16 avoids this because that function returns false for BF16
+by name. Measured against an f32 reference: 1.7e-3 relative perplexity error
+before, 1.1e-5 after, at a cost of about 3% of prefill.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index fe3ad4260..343854446 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3151,7 +3151,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_MXFP4],   "dequant_mxfp4",   dequant_mxfp4_len,   dequant_mxfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_NVFP4],   "dequant_nvfp4",   dequant_nvfp4_len,   dequant_nvfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q12H],    "dequant_q12h",    dequant_q12h_len,    dequant_q12h_data,    "main", 2, 5 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q12H],    "dequant_q12h",    dequant_q12h_len,    dequant_q12h_data,    "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
+ 
+     // get_rows
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
+@@ -6487,8 +6487,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     const bool qy_needs_dequant = y_needs_reformat;
+ 
+     if (qx_needs_dequant) {
+-        // dequant src0 to f16
+-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, ggml_prec_get_acc(dst));
++        // dequant src0 to f16.
++        // Q12H is a LOSSLESS format - bit-faithful weights are its entire point -
++        // so force f32 accumulation for it. With f16 accumulation the GEMM sums
++        // thousands of products per output in half precision, measured at ~0.17%
++        // perplexity against an f32 ground truth. (bf16 already gets f32 accumulate
++        // by name in ggml_vk_get_mul_mat_mat_f16acc; this gives Q12H the same.)
++        const ggml_prec acc_prec = (src0->type == GGML_TYPE_Q12H) ? GGML_PREC_F32 : ggml_prec_get_acc(dst);
++        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, acc_prec);
+     }
+ 
+     GGML_ASSERT(mmp_map != nullptr);
+-- 
+2.55.0.windows.3
+

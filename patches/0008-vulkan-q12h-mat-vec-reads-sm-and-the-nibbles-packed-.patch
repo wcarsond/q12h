@@ -1,0 +1,172 @@
+From 6ad03c60f77b461620f93b9a09aeb2d5c1c8b322 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Sun, 25 Oct 2026 19:24:19 -0400
+Subject: [PATCH 08/12] vulkan: q12h mat-vec reads sm and the nibbles packed,
+ not a byte at a time
+
+Every field of block_q12h starts on a 4-byte boundary and the block is 412
+bytes, so a 16- and a 32-bit view share the byte view's stride. dequantize4
+now takes one 32-bit load for four sm bytes and one 16-bit load for their
+four nibbles instead of eight byte loads, and the exception scan is skipped
+with a single compare against 0xFFFFFFFF, which is what epos reads as when
+all four slots are empty - nearly every block, and uniform across it.
+
+Qwen3-1.7B on one Arc Pro B60, llama-bench -p 512 -n 128 -r 3:
+  tg128  64.01 -> 104.86 t/s   (bf16: 104.64)
+  pp512  4405  -> 4460.9  t/s  (bf16: 2130.0)
+Decode is now at parity with bf16 and prompt processing is 2.1x bf16, which
+is the f16 coopmat matmul the dequant path feeds. On the iGPU (Vulkan0):
+tg128 12.0 -> 17.83 t/s, pp512 229.6 (bf16 20.90 / 214.1).
+
+Greedy output still byte-identical across q12h GPU, q12h CPU and bf16 GPU,
+and test-backend-ops MUL_MAT on Vulkan1 is still 2288/2288 with 13 q12h cases.
+---
+ .../vulkan-shaders/dequant_funcs.glsl         | 62 ++++++++++++++-----
+ .../vulkan-shaders/dequant_q12h.comp          |  2 +
+ .../src/ggml-vulkan/vulkan-shaders/types.glsl | 23 +++++++
+ 3 files changed, 72 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index 560a68bd1..80ee67137 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -545,16 +545,17 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+ #endif
+ 
+ #if defined(DATA_A_Q12H)
+-// Rebuild one bf16 bit pattern out of the block. The <=4 exception slots are filled in
+-// order and 0xFF terminates the list, so the loop breaks there exactly like
+-// dequantize_row_q12h() on the CPU does.
+-uint q12h_bits(uint ibi, uint j) {
+-    const uint sm = uint(data_a[ibi].sm[j]);
+-    const uint nb = uint(data_a[ibi].nib[j >> 1]);
+-    const uint ix = ((j & 1) != 0) ? (nb >> 4) : (nb & 0xF);
+-    uint bits = ((sm >> 7) << 15) | (uint(data_a[ibi].lut[ix]) << 7) | (sm & 0x7F);
++// Apply the block's exception slots to weight j. The slots are filled in order and
++// 0xFF terminates the list, so the scan breaks there exactly like
++// dequantize_row_q12h() on the CPU does. All four slots empty reads as 0xFFFFFFFF,
++// which is the common case by far and is uniform across the whole block.
++uint q12h_except(uint ibi, uint j, uint bits) {
++    const uint ep = data_a_packed32[ibi].epos;
++    if (ep == 0xFFFFFFFF) {
++        return bits;
++    }
+     for (uint s = 0; s < 4; ++s) {
+-        const uint p = uint(data_a[ibi].epos[s]);
++        const uint p = (ep >> (8 * s)) & 0xFF;
+         if (p == 0xFF) {
+             break;
+         }
+@@ -564,21 +565,52 @@ uint q12h_bits(uint ibi, uint j) {
+     }
+     return bits;
+ }
+-// bf16 -> f32 is a 16-bit left shift
++// sign(1) << 15 | lut[nibble] << 7 | mantissa(7); bf16 -> f32 is a 16-bit left shift
+ float q12h_dequant1(uint ibi, uint j) {
+-    return uintBitsToFloat(q12h_bits(ibi, j) << 16);
++    const uint sm = uint(data_a[ibi].sm[j]);
++    const uint nb = uint(data_a[ibi].nib[j >> 1]);
++    const uint ix = ((j & 1) != 0) ? (nb >> 4) : (nb & 0xF);
++    uint bits = ((sm & 0x80) << 8) | (uint(data_a[ibi].lut[ix]) << 7) | (sm & 0x7F);
++    bits = q12h_except(ibi, j, bits);
++    return uintBitsToFloat(bits << 16);
+ }
+ FLOAT_TYPE dequantize1(uint ib, uint iqs, uint a_offset) {
+     return FLOAT_TYPE(q12h_dequant1(a_offset + ib, iqs));
+ }
++// iqs must be even: one 16-bit sm load and one nibble byte cover both weights
+ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+     const uint ibi = a_offset + ib;
+-    return vec2(q12h_dequant1(ibi, iqs), q12h_dequant1(ibi, iqs + 1));
+-}
++    const uint sm2 = uint(data_a_packed16[ibi].sm[iqs >> 1]);
++    const uint nb  = uint(data_a[ibi].nib[iqs >> 1]);
++    const uint s0  = sm2 & 0xFF;
++    const uint s1  = sm2 >> 8;
++    uint b0 = ((s0 & 0x80) << 8) | (uint(data_a[ibi].lut[nb & 0xF]) << 7) | (s0 & 0x7F);
++    uint b1 = ((s1 & 0x80) << 8) | (uint(data_a[ibi].lut[nb >> 4 ]) << 7) | (s1 & 0x7F);
++    b0 = q12h_except(ibi, iqs,     b0);
++    b1 = q12h_except(ibi, iqs + 1, b1);
++    return vec2(uintBitsToFloat(b0 << 16), uintBitsToFloat(b1 << 16));
++}
++// iqs must be a multiple of 4: one 32-bit sm load and one 16-bit nibble load cover
++// all four weights, which is what makes this worth doing on a byte-load-shy GPU
+ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+     const uint ibi = a_offset + ib;
+-    return vec4(q12h_dequant1(ibi, iqs    ), q12h_dequant1(ibi, iqs + 1),
+-                q12h_dequant1(ibi, iqs + 2), q12h_dequant1(ibi, iqs + 3));
++    const uint  sm4 = data_a_packed32[ibi].sm[iqs >> 2];
++    const uint  nb2 = uint(data_a_packed16[ibi].nib[iqs >> 2]);
++    const uvec4 s   = uvec4(sm4, sm4 >> 8, sm4 >> 16, sm4 >> 24) & 0xFF;
++    const uvec4 ix  = uvec4(nb2, nb2 >> 4, nb2 >>  8, nb2 >> 12) & 0xF;
++    uvec4 b = ((s & 0x80) << 8) | (s & 0x7F);
++    b.x |= uint(data_a[ibi].lut[ix.x]) << 7;
++    b.y |= uint(data_a[ibi].lut[ix.y]) << 7;
++    b.z |= uint(data_a[ibi].lut[ix.z]) << 7;
++    b.w |= uint(data_a[ibi].lut[ix.w]) << 7;
++    if (data_a_packed32[ibi].epos != 0xFFFFFFFF) {
++        b.x = q12h_except(ibi, iqs,     b.x);
++        b.y = q12h_except(ibi, iqs + 1, b.y);
++        b.z = q12h_except(ibi, iqs + 2, b.z);
++        b.w = q12h_except(ibi, iqs + 3, b.w);
++    }
++    return vec4(uintBitsToFloat(b.x << 16), uintBitsToFloat(b.y << 16),
++                uintBitsToFloat(b.z << 16), uintBitsToFloat(b.w << 16));
+ }
+ vec2 get_dm(uint ib, uint a_offset) {
+     return vec2(1.0, 0.0);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+index 8ccca22fb..015b56eb1 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+@@ -5,6 +5,8 @@
+ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer A {block_q12h data_a[];};
++layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
++layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+ layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+ 
+ #include "dequant_funcs.glsl"
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index bc02cbfd0..e8f0b2307 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1888,10 +1888,33 @@ struct block_q12h
+     uint8_t  sm[QUANT_K_Q12H];
+ };
+ 
++// Every field starts on a 4-byte boundary (lut 0, epos 16, eval 20, nib 28, sm 156)
++// and the block is 412 bytes, so the 16- and 32-bit views have the same stride as
++// the byte view and the mat-vec can pull four weights' sm and nibbles in two loads.
++struct block_q12h_packed16
++{
++    uint16_t lut[16/2];
++    uint16_t epos[4/2];
++    uint16_t eval[4];
++    uint16_t nib[QUANT_K_Q12H/2/2];
++    uint16_t sm[QUANT_K_Q12H/2];
++};
++
++struct block_q12h_packed32
++{
++    uint32_t lut[16/4];
++    uint32_t epos;
++    uint32_t eval[8/4];
++    uint32_t nib[QUANT_K_Q12H/2/4];
++    uint32_t sm[QUANT_K_Q12H/4];
++};
++
+ #if defined(DATA_A_Q12H)
+ #define QUANT_K QUANT_K_Q12H
+ #define QUANT_R QUANT_R_Q12H
+ #define A_TYPE block_q12h
++#define A_TYPE_PACKED16 block_q12h_packed16
++#define A_TYPE_PACKED32 block_q12h_packed32
+ #endif
+ 
+ #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,332 @@
+From 1e7de4d1bc4892b992e1981f1a2344c7a2becc9b Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Sun, 25 Oct 2026 20:21:10 -0400
+Subject: [PATCH 09/12] q12h v2: a per-block shift-offset mode, so the mat-vec
+ drops the lut gather
+
+The distinct exponents in a 256-weight block are a near-contiguous run, so when
+they all fit a 16-wide window the nibble can be a shift amount instead of a LUT
+index:
+
+  E = base + offset  =>  w = (-1)^s * ((128+m) << offset) * 2^(base-134)
+
+(128+m) << 15 < 2^24, so the magnitude is exact in fp32, and the scale is a
+power of two, so v2 is still bit-for-bit lossless. The win is that the shader
+stops gathering lut[ix]: four scattered byte loads per four weights, every lane
+indexing into the same 16 bytes, replaced by an integer shift.
+
+Layout is unchanged - 412 bytes, because ggml needs a constant type_size, so
+this is an alternative layout and not a smaller one. lut[0] picks the mode:
+0xFF means shift-offset with lut[1] = base, otherwise LUT mode exactly as v1.
+0xFF is free as a marker because it is an inf/nan exponent that a LUT block can
+never hold, which also means a v1 file still decodes correctly under a v2 build
+(checked: all 7,936,000 blocks of the v1 GGUF read back as LUT mode, and the v1
+file generates the same text as v2 under this build).
+
+Blocks that do not fit fall back to LUT mode, so correctness is by construction.
+Measured over Qwen2.5-Coder-7B (29,747,200 blocks): span <= 15 in 98.3248%,
+and 98.2142% also clear the base >= 8 guard that keeps 2^(base-134) a normal
+float and excludes bf16 zero/subnormal, for which the (128+m) identity does not
+hold. On Qwen3-1.7B 98.5794% of blocks ended up in shift mode.
+
+The 2^(base-134) comes out through get_dm so mul_mat_vec applies it once per 8
+weights - which never cross a block - after the dot product. Scaling by a power
+of two is exact and commutes with rounding, so that is bit-identical to scaling
+each weight.
+
+Gates: test-backend-ops MUL_MAT 2288/2288 on Vulkan1 and on Vulkan0 with 13
+q12h cases each; greedy text byte-identical across q12h-v2 GPU, q12h-v2 CPU,
+bf16 GPU, the iGPU and the v1 reference; and the v2 -> BF16 round-trip is
+bit-exact over all 311 tensors / 4,063,727,616 bytes against the original bf16
+GGUF, producing a file byte-identical to the v1 round-trip.
+
+One trap worth recording: in GLSL `uvec4 != uvec4` collapses to a SCALAR bool,
+so selecting the sign with mix(mag, -mag, bvec4(s & 0x80 != 0)) negated all four
+lanes whenever any one of them was negative. The sign is now OR'd into bit 31
+directly. test-backend-ops caught it with ERR ~1-9 before any model ran.
+---
+ ggml/src/ggml-common.h                        | 12 ++++
+ ggml/src/ggml-cpu/quants.c                    | 40 ++++++++----
+ ggml/src/ggml-quants.c                        | 64 ++++++++++++++++++-
+ .../vulkan-shaders/dequant_funcs.glsl         | 42 ++++++++++--
+ .../vulkan-shaders/dequant_q12h.comp          |  3 +-
+ 5 files changed, 143 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index 6c815b704..6bbd6e477 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -199,6 +199,18 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 b
+ //   sm[256]  - sign(1) << 7 | mantissa(7) per weight
+ // Dequant: u16 = (sm>>7)<<15 | lut[nib]<<7 | (sm&0x7F); then <=4 overwrites
+ // from the exception slots; bf16 -> f32 is (u16 << 16).
++// Two per-block modes share this one 412-byte layout (ggml needs a constant
++// type_size, so v2 is an alternative layout, not a smaller one - the prize is
++// speed). lut[0] selects:
++//   lut[0] != 0xFF  LUT mode: lut[16] of exponent bytes, nibble = LUT index.
++//   lut[0] == 0xFF  shift-offset mode: lut[1] = base exponent, lut[2..15] zero,
++//                   nibble = offset, so E = base + nibble and
++//                   w = (-1)^s * ((128+m) << offset) * 2^(base-134).
++//                   No LUT read at all, and no exception slots are used.
++// 0xFF is a free marker because it is an inf/nan exponent, which a LUT-mode
++// block can never hold (ggml_validate_row_data rejects it), so a v1 file still
++// decodes correctly under a v2 build.
++#define Q12H_MODE_SHIFT 0xFF
+ #define QK12H 256
+ typedef struct {
+     uint8_t  lut[16];
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 7a25d190a..2965d068b 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -198,19 +198,35 @@ void ggml_vec_dot_q12h_f32(int n, float * GGML_RESTRICT s, size_t bs, const void
+     float sumf = 0.0f;
+ 
+     for (int i = 0; i < nb; i++) {
++        // Decoded here rather than through dequantize_row_q12h() so the loop stays
++        // in this translation unit and keeps vectorising - calling across to
++        // ggml-quants.c costs about 2.6x on this path.
+         float xb[QK12H];
+-        for (int j = 0; j < qk; j++) {
+-            const uint8_t sm = x[i].sm[j];
+-            const uint8_t ix = (j & 1) ? (x[i].nib[j >> 1] >> 4) : (x[i].nib[j >> 1] & 0xF);
+-            const uint16_t bits = (uint16_t)(((sm >> 7) << 15) | (x[i].lut[ix] << 7) | (sm & 0x7F));
+-            const uint32_t u = (uint32_t)bits << 16;
+-            memcpy(&xb[j], &u, sizeof(float));
+-        }
+-        for (int t = 0; t < 4; t++) {
+-            const uint8_t p = x[i].epos[t];
+-            if (p == 0xFF) break;
+-            const uint32_t u = (uint32_t)x[i].eval[t] << 16;
+-            memcpy(&xb[p], &u, sizeof(float));
++        if (x[i].lut[0] == Q12H_MODE_SHIFT) {
++            // shift-offset mode: no LUT read, no exception slots by construction
++            const uint32_t su = (uint32_t)(x[i].lut[1] - 7) << 23;  // 2^(base-134)
++            float scale;
++            memcpy(&scale, &su, sizeof(scale));
++            for (int j = 0; j < qk; j++) {
++                const uint8_t sm  = x[i].sm[j];
++                const uint8_t off = (j & 1) ? (x[i].nib[j >> 1] >> 4) : (x[i].nib[j >> 1] & 0xF);
++                const float   mag = (float)((uint32_t)(128u + (sm & 0x7F)) << off);
++                xb[j] = (sm & 0x80) ? -mag * scale : mag * scale;
++            }
++        } else {
++            for (int j = 0; j < qk; j++) {
++                const uint8_t sm = x[i].sm[j];
++                const uint8_t ix = (j & 1) ? (x[i].nib[j >> 1] >> 4) : (x[i].nib[j >> 1] & 0xF);
++                const uint16_t bits = (uint16_t)(((sm >> 7) << 15) | (x[i].lut[ix] << 7) | (sm & 0x7F));
++                const uint32_t u = (uint32_t)bits << 16;
++                memcpy(&xb[j], &u, sizeof(float));
++            }
++            for (int t = 0; t < 4; t++) {
++                const uint8_t p = x[i].epos[t];
++                if (p == 0xFF) break;
++                const uint32_t u = (uint32_t)x[i].eval[t] << 16;
++                memcpy(&xb[p], &u, sizeof(float));
++            }
+         }
+ 
+         const float * GGML_RESTRICT yb = y + (size_t)i*qk;
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index a4ca459c0..168da6e5b 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -80,6 +80,15 @@ static inline uint16_t q12h_f32_to_bf16_bits(float f) {
+     return (uint16_t)((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+ }
+ 
++// 2^(e-134), exact: the per-block scale that turns a shift-mode magnitude
++// (128+m) << offset back into the bf16 value it stands for.
++static inline float q12h_shift_scale(int base) {
++    const uint32_t u = (uint32_t)(base - 7) << 23;   // (base - 134) + 127
++    float f;
++    memcpy(&f, &u, sizeof(f));
++    return f;
++}
++
+ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_RESTRICT y, int64_t k) {
+     assert(k % QK12H == 0);
+     const int nb = k / QK12H;
+@@ -87,10 +96,39 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+     for (int i = 0; i < nb; i++) {
+         uint16_t bits[QK12H];
+         int      cnt[256] = { 0 };
++        int      emin = 255, emax = 0;
+         for (int j = 0; j < QK12H; j++) {
+             bits[j] = q12h_f32_to_bf16_bits(x[i*QK12H + j]);
+-            cnt[(bits[j] >> 7) & 0xFF]++;
++            const int e = (bits[j] >> 7) & 0xFF;
++            cnt[e]++;
++            if (e < emin) emin = e;
++            if (e > emax) emax = e;
++        }
++
++        // Shift-offset mode (v2). When every exponent in the block fits a 16-wide
++        // window of normal bf16 exponents, the nibble stops being a LUT index and
++        // becomes a shift amount: E = base + offset, so
++        //   w = (-1)^s * ((128+m) << offset) * 2^(base-134)
++        // and the dequantiser never touches the LUT. (128+m) << 15 < 2^24 so the
++        // magnitude is exact in fp32, and the scale is a power of two, so this is
++        // still bit-for-bit lossless. 98.21% of the blocks of a real 7B qualify;
++        // the rest fall back to LUT mode below, so correctness is by construction.
++        // emin >= 8 keeps the scale a normal float and excludes E == 0 (bf16
++        // zero/subnormal), for which the (128+m) identity does not hold at all.
++        if (emax - emin <= 15 && emin >= 8 && emax <= 254) {
++            y[i].lut[0] = Q12H_MODE_SHIFT;       // a LUT-mode block can never hold this
++            y[i].lut[1] = (uint8_t)emin;
++            for (int s = 2; s < 16; s++) y[i].lut[s] = 0;
++            for (int s = 0; s < 4; s++) { y[i].epos[s] = 0xFF; y[i].eval[s] = 0; }
++            for (int j = 0; j < QK12H; j++) {
++                const uint8_t off = (uint8_t)(((bits[j] >> 7) & 0xFF) - emin);
++                if (j & 1) y[i].nib[j >> 1] |= (uint8_t)(off << 4);
++                else       y[i].nib[j >> 1]  = off;
++                y[i].sm[j] = (uint8_t)((((bits[j] >> 15) & 1) << 7) | (bits[j] & 0x7F));
++            }
++            continue;
+         }
++
+         // top-16 exponents by count (count desc, value asc on ties: deterministic)
+         uint8_t inv[256];
+         memset(inv, 0xFF, sizeof(inv));
+@@ -107,6 +145,9 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+             y[i].lut[s] = (uint8_t)best;
+             inv[best]   = (uint8_t)s;
+         }
++        // lut[0] == 0xFF is the shift-mode marker, so a LUT block must never hold
++        // it. It only could for an inf/nan weight, which ggml rejects anyway.
++        GGML_ASSERT(y[i].lut[0] != Q12H_MODE_SHIFT && "q12h: inf/nan exponent in a LUT-mode block");
+         int ne = 0;
+         for (int s = 0; s < 4; s++) { y[i].epos[s] = 0xFF; y[i].eval[s] = 0; }
+         for (int j = 0; j < QK12H; j++) {
+@@ -131,6 +172,17 @@ void dequantize_row_q12h(const block_q12h * GGML_RESTRICT x, float * GGML_RESTRI
+     const int nb = k / QK12H;
+ 
+     for (int i = 0; i < nb; i++) {
++        if (x[i].lut[0] == Q12H_MODE_SHIFT) {
++            // shift-offset mode: no LUT read, and no exception slots by construction
++            const float scale = q12h_shift_scale(x[i].lut[1]);
++            for (int j = 0; j < QK12H; j++) {
++                const uint8_t sm  = x[i].sm[j];
++                const uint8_t off = (j & 1) ? (x[i].nib[j >> 1] >> 4) : (x[i].nib[j >> 1] & 0xF);
++                const float   mag = (float)((uint32_t)(128u + (sm & 0x7F)) << off);
++                y[i*QK12H + j] = (sm & 0x80) ? -mag * scale : mag * scale;
++            }
++            continue;
++        }
+         for (int j = 0; j < QK12H; j++) {
+             const uint8_t sm = x[i].sm[j];
+             const uint8_t ix = (j & 1) ? (x[i].nib[j >> 1] >> 4) : (x[i].nib[j >> 1] & 0xF);
+@@ -5604,6 +5656,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+                 // exactly an inf/nan weight.
+                 const block_q12h * q = (const block_q12h *) data;
+                 for (size_t i = 0; i < nb; ++i) {
++                    if (q[i].lut[0] == Q12H_MODE_SHIFT) {
++                        // shift-offset mode: the highest exponent the nibbles can
++                        // reach is lut[1] + 15, so that is what must stay below 0xFF
++                        if (q[i].lut[1] < 8 || q[i].lut[1] > 239) {
++                            fprintf(stderr, "ggml_validate_row_data: q12h base exponent %u out of range at block %zu\n",
++                                    (unsigned) q[i].lut[1], i);
++                            return false;
++                        }
++                        continue;
++                    }
+                     for (int s = 0; s < 16; ++s) {
+                         if (q[i].lut[s] == 0xFF) {
+                             fprintf(stderr, "ggml_validate_row_data: found inf/nan exponent in lut at block %zu\n", i);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index 80ee67137..99af3f635 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -565,11 +565,24 @@ uint q12h_except(uint ibi, uint j, uint bits) {
+     }
+     return bits;
+ }
++// Which of the two block modes this is. lut[0] == 0xFF means shift-offset: the
++// nibble is a shift amount, not a LUT index, so the fast path never reads the
++// lut region at all. One broadcast byte load per call, and the answer is uniform
++// across the whole block, so the branch is uniform across every lane.
++bool q12h_is_shift(uint ibi) {
++    return uint(data_a[ibi].lut[0]) == 0xFF;
++}
++
+ // sign(1) << 15 | lut[nibble] << 7 | mantissa(7); bf16 -> f32 is a 16-bit left shift
+ float q12h_dequant1(uint ibi, uint j) {
+     const uint sm = uint(data_a[ibi].sm[j]);
+     const uint nb = uint(data_a[ibi].nib[j >> 1]);
+     const uint ix = ((j & 1) != 0) ? (nb >> 4) : (nb & 0xF);
++    if (q12h_is_shift(ibi)) {
++        // ((128+m) << offset), signed; the 2^(base-134) scale comes from get_dm
++        const float mag = float((128 + (sm & 0x7F)) << ix);
++        return (sm & 0x80) != 0 ? -mag : mag;
++    }
+     uint bits = ((sm & 0x80) << 8) | (uint(data_a[ibi].lut[ix]) << 7) | (sm & 0x7F);
+     bits = q12h_except(ibi, j, bits);
+     return uintBitsToFloat(bits << 16);
+@@ -582,10 +595,14 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+     const uint ibi = a_offset + ib;
+     const uint sm2 = uint(data_a_packed16[ibi].sm[iqs >> 1]);
+     const uint nb  = uint(data_a[ibi].nib[iqs >> 1]);
+-    const uint s0  = sm2 & 0xFF;
+-    const uint s1  = sm2 >> 8;
+-    uint b0 = ((s0 & 0x80) << 8) | (uint(data_a[ibi].lut[nb & 0xF]) << 7) | (s0 & 0x7F);
+-    uint b1 = ((s1 & 0x80) << 8) | (uint(data_a[ibi].lut[nb >> 4 ]) << 7) | (s1 & 0x7F);
++    const uvec2 s  = uvec2(sm2, sm2 >> 8) & 0xFF;
++    const uvec2 ix = uvec2(nb, nb >> 4)   & 0xF;
++    if (q12h_is_shift(ibi)) {
++        const uvec2 mag = floatBitsToUint(vec2((128 + (s & 0x7F)) << ix));
++        return uintBitsToFloat(mag | ((s & 0x80) << 24));
++    }
++    uint b0 = ((s.x & 0x80) << 8) | (uint(data_a[ibi].lut[ix.x]) << 7) | (s.x & 0x7F);
++    uint b1 = ((s.y & 0x80) << 8) | (uint(data_a[ibi].lut[ix.y]) << 7) | (s.y & 0x7F);
+     b0 = q12h_except(ibi, iqs,     b0);
+     b1 = q12h_except(ibi, iqs + 1, b1);
+     return vec2(uintBitsToFloat(b0 << 16), uintBitsToFloat(b1 << 16));
+@@ -598,6 +615,15 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+     const uint  nb2 = uint(data_a_packed16[ibi].nib[iqs >> 2]);
+     const uvec4 s   = uvec4(sm4, sm4 >> 8, sm4 >> 16, sm4 >> 24) & 0xFF;
+     const uvec4 ix  = uvec4(nb2, nb2 >> 4, nb2 >>  8, nb2 >> 12) & 0xF;
++    if (q12h_is_shift(ibi)) {
++        // The whole point of v2: an integer shift instead of four lut[] gathers.
++        // The sign is OR'd straight into bit 31 (sm bit 7 << 24) rather than
++        // selected - in GLSL `uvec4 != uvec4` collapses to a SCALAR bool, so a
++        // mix()/bvec4 selector would negate all four lanes whenever any one of
++        // them was negative. The 2^(base-134) scale comes out through get_dm.
++        const uvec4 mag = floatBitsToUint(vec4((128 + (s & 0x7F)) << ix));
++        return uintBitsToFloat(mag | ((s & 0x80) << 24));
++    }
+     uvec4 b = ((s & 0x80) << 8) | (s & 0x7F);
+     b.x |= uint(data_a[ibi].lut[ix.x]) << 7;
+     b.y |= uint(data_a[ibi].lut[ix.y]) << 7;
+@@ -612,7 +638,15 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+     return vec4(uintBitsToFloat(b.x << 16), uintBitsToFloat(b.y << 16),
+                 uintBitsToFloat(b.z << 16), uintBitsToFloat(b.w << 16));
+ }
++// In shift mode the block's 2^(base-134) comes out here and mul_mat_vec applies it
++// once per 8 weights - which never cross a block - after the dot product. Scaling
++// by a power of two is exact and commutes with rounding, so pulling it out of the
++// inner loop keeps the result bit-identical to multiplying each weight by it.
+ vec2 get_dm(uint ib, uint a_offset) {
++    const uint ibi = a_offset + ib;
++    if (q12h_is_shift(ibi)) {
++        return vec2(uintBitsToFloat((uint(data_a[ibi].lut[1]) - 7) << 23), 0.0);
++    }
+     return vec2(1.0, 0.0);
+ }
+ #endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+index 015b56eb1..2dc7d8b4c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+@@ -24,7 +24,8 @@ void main() {
+     const uint j     = 4 * tid;
+     const uint b_idx = ib * QUANT_K + j;
+ 
+-    const vec4 v = dequantize4(ib, j, 0);
++    // get_dm carries the 2^(base-134) scale in shift-offset mode, and 1.0 in LUT mode
++    const vec4 v = dequantize4(ib, j, 0) * get_dm(ib, 0).x;
+ 
+     data_b[b_idx    ] = D_TYPE(v.x);
+     data_b[b_idx + 1] = D_TYPE(v.y);
+-- 
+2.55.0.windows.3
+

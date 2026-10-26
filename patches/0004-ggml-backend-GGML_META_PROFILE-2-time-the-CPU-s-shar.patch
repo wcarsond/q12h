@@ -1,0 +1,83 @@
+From a8d6933692d170e3cf6b28fc2c2220e0ddcaab7c Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Thu, 1 Oct 2026 02:30:09 -0400
+Subject: [PATCH 04/12] ggml-backend : GGML_META_PROFILE=2, time the CPU's
+ share of a tensor-split graph
+
+Mode 1 forces a synchronization around every all-reduce to attribute time to
+it. Mode 2 adds no synchronization: it times the CPU's recording and
+submitting inside each meta graph and the gap until the next one, so a run
+can be told CPU-bound (gap near zero) from backend-bound (gap near the total).
+---
+ ggml/src/ggml-backend-meta.cpp | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 32792fbfd..2e3a5b4a7 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2471,9 +2471,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     // GGML_META_PROFILE=1: time the all-reduces between subgraphs. Each one is timed from a point where every backend
+     // has finished the preceding subgraph to the point where the all-reduce has completed on every backend. The extra
+     // synchronizations cost speed, so use this to attribute time, not to benchmark. Printed every 64 graphs.
+-    static const bool profile = getenv("GGML_META_PROFILE") != nullptr;
++    // GGML_META_PROFILE=2: no added synchronization; time the CPU's own work in this call (recording and submitting)
++    // and the gap until the next call (the caller waiting for the backends, sampling). A gap near zero means the CPU
++    // is the bottleneck; a gap near the whole graph means the backends are.
++    static const int profile = getenv("GGML_META_PROFILE") != nullptr ? atoi(getenv("GGML_META_PROFILE")) : 0;
+     static int64_t prof_graphs = 0, prof_reduces = 0, prof_reduce_us = 0, prof_reduce_bytes = 0, prof_graph_us = 0;
++    static int64_t prof_submit_us = 0, prof_gap_us = 0, prof_t_prev_end = 0;
+     const int64_t prof_t_graph = profile ? ggml_time_us() : 0;
++    if (profile == 2 && prof_t_prev_end != 0) {
++        prof_gap_us += prof_t_graph - prof_t_prev_end;
++    }
+     auto sync_all = [&]() {
+         for (size_t j = 0; j < n_backends; j++) {
+             ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+@@ -2491,7 +2498,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+             int64_t prof_t_reduce = 0;
+-            if (profile) {
++            if (profile == 1) {
+                 sync_all();
+                 prof_t_reduce = ggml_time_us();
+             }
+@@ -2515,7 +2522,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 }
+             }
+ 
+-            if (profile) {
++            if (profile == 1) {
+                 sync_all();
+                 prof_reduce_us += ggml_time_us() - prof_t_reduce;
+                 prof_reduces++;
+@@ -2525,7 +2532,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+     }
+ 
+-    if (profile) {
++    if (profile == 1) {
+         sync_all();
+         prof_graph_us += ggml_time_us() - prof_t_graph;
+         if (++prof_graphs % 64 == 0) {
+@@ -2536,6 +2543,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 prof_graph_us ? 100.0 * prof_reduce_us / prof_graph_us : 0.0);
+             prof_reduces = prof_reduce_us = prof_reduce_bytes = prof_graph_us = 0;
+         }
++    } else if (profile == 2) {
++        prof_t_prev_end = ggml_time_us();
++        prof_submit_us += prof_t_prev_end - prof_t_graph;
++        if (++prof_graphs % 64 == 0) {
++            fprintf(stderr, "%s: last 64 graphs: CPU submit %.0f us/graph, gap to next graph %.0f us/graph (%.0f%% of the %.0f us total)\n",
++                __func__, prof_submit_us / 64.0, prof_gap_us / 64.0,
++                (prof_submit_us + prof_gap_us) ? 100.0 * prof_gap_us / (prof_submit_us + prof_gap_us) : 0.0,
++                (prof_submit_us + prof_gap_us) / 64.0);
++            prof_submit_us = prof_gap_us = 0;
++        }
+     }
+     return GGML_STATUS_SUCCESS;
+ }
+-- 
+2.55.0.windows.3
+

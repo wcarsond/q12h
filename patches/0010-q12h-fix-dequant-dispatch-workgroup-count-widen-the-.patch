@@ -1,0 +1,114 @@
+From 2f1136cd40de5fec2e1fa1b0f853cf9d89211f52 Mon Sep 17 00:00:00 2001
+From: Carson Daniel <wcarsond@gmail.com>
+Date: Sun, 25 Oct 2026 22:16:24 -0400
+Subject: [PATCH 10/12] q12h: fix dequant dispatch workgroup count, widen the
+ CPU dot accumulator
+
+The dequant pipeline declared 256*4 elements per workgroup, valid only to
+67M elements; a 311M-element output.weight needed 304k workgroups against a
+65536 limit and tripped the dispatch assert. Raised to 256*32 with a matching
+loop in the shader. Separately, the CPU dot product summed into a single
+float; it now uses four double accumulators.
+---
+ ggml/src/ggml-cpu/quants.c                    | 16 +++++--
+ .../vulkan-shaders/dequant_q12h.comp          | 47 ++++++++++++-------
+ 2 files changed, 41 insertions(+), 22 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 2965d068b..8e90367a6 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -195,7 +195,12 @@ void ggml_vec_dot_q12h_f32(int n, float * GGML_RESTRICT s, size_t bs, const void
+     const block_q12h * GGML_RESTRICT x = vx;
+     const float      * GGML_RESTRICT y = vy;
+ 
+-    float sumf = 0.0f;
++    // Accumulate in ggml_float (double) across four partial sums, as
++    // ggml_vec_dot_bf16 does. A single f32 accumulator over thousands of terms
++    // compounds rounding error: measured 0.17% perplexity from f32 ground
++    // truth where bf16 sits at 0.003%. The weights are bit-exact either way;
++    // this is purely the summation.
++    double acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+ 
+     for (int i = 0; i < nb; i++) {
+         // Decoded here rather than through dequantize_row_q12h() so the loop stays
+@@ -230,12 +235,15 @@ void ggml_vec_dot_q12h_f32(int n, float * GGML_RESTRICT s, size_t bs, const void
+         }
+ 
+         const float * GGML_RESTRICT yb = y + (size_t)i*qk;
+-        for (int j = 0; j < qk; j++) {
+-            sumf += xb[j] * yb[j];
++        for (int j = 0; j < qk; j += 4) {
++            acc0 += (double)(xb[j    ] * yb[j    ]);
++            acc1 += (double)(xb[j + 1] * yb[j + 1]);
++            acc2 += (double)(xb[j + 2] * yb[j + 2]);
++            acc3 += (double)(xb[j + 3] * yb[j + 3]);
+         }
+     }
+ 
+-    *s = sumf;
++    *s = (float)(acc0 + acc1 + acc2 + acc3);
+ }
+ 
+ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+index 2dc7d8b4c..49df3305c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+@@ -11,24 +11,35 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+ 
+ #include "dequant_funcs.glsl"
+ 
+-void main() {
+-    // One workgroup of 256 threads covers 4 blocks of 256 weights:
+-    // 64 threads per block, 4 weights each.
+-    const uint ib  = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+-    const uint tid = gl_LocalInvocationID.x % 64;
++// Blocks covered by one workgroup. 256 threads handle 4 blocks at a time
++// (64 threads per block, 4 weights each), so this loops BLOCKS_PER_WG/4 times.
++// MUST match the dispatch divisor for GGML_TYPE_Q12H in ggml-vulkan.cpp,
++// which is {256 * BLOCKS_PER_WG, 1, 1}. At 4 this covered only 1024 elements
++// per workgroup - the smallest of any type - so a 311M-element tensor
++// (e.g. a Q12H output.weight) asked for ~304k workgroups and tripped
++// maxComputeWorkGroupCount. The other quant types use 16 to 64 blocks.
++#define BLOCKS_PER_WG 32
+ 
+-    if (ib >= p.nel / QUANT_K) {
+-        return;
++void main() {
++    const uint tid     = gl_LocalInvocationID.x % 64;
++    const uint sub     = gl_LocalInvocationID.x / 64;   // which of the 4 concurrent blocks
++    const uint nblocks = p.nel / QUANT_K;
++    const uint j       = 4 * tid;
++
++    [[unroll]] for (uint k = 0; k < BLOCKS_PER_WG; k += 4) {
++        const uint ib = gl_WorkGroupID.x * BLOCKS_PER_WG + k + sub;
++        if (ib >= nblocks) {
++            return;
++        }
++
++        const uint b_idx = ib * QUANT_K + j;
++
++        // get_dm carries the 2^(base-134) scale in shift-offset mode, and 1.0 in LUT mode
++        const vec4 v = dequantize4(ib, j, 0) * get_dm(ib, 0).x;
++
++        data_b[b_idx    ] = D_TYPE(v.x);
++        data_b[b_idx + 1] = D_TYPE(v.y);
++        data_b[b_idx + 2] = D_TYPE(v.z);
++        data_b[b_idx + 3] = D_TYPE(v.w);
+     }
+-
+-    const uint j     = 4 * tid;
+-    const uint b_idx = ib * QUANT_K + j;
+-
+-    // get_dm carries the 2^(base-134) scale in shift-offset mode, and 1.0 in LUT mode
+-    const vec4 v = dequantize4(ib, j, 0) * get_dm(ib, 0).x;
+-
+-    data_b[b_idx    ] = D_TYPE(v.x);
+-    data_b[b_idx + 1] = D_TYPE(v.y);
+-    data_b[b_idx + 2] = D_TYPE(v.z);
+-    data_b[b_idx + 3] = D_TYPE(v.w);
+ }
+-- 
+2.55.0.windows.3
+
