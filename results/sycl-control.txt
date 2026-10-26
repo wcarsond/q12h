@@ -1,0 +1,54 @@
+SYCL control: the same Arc silicon, the same models, a different backend
+=======================================================================
+
+Why this run exists
+-------------------
+The Vulkan backend loses 3.7x of throughput when the batch crosses 8 columns
+(-ub 8 = 2151 t/s, -ub 9 = 579 t/s on an Arc Pro B60). The obvious objection is
+that the hardware simply does not like 9, and that mul_mat_vec_max_cols = 8 is
+therefore protecting users from a real limit.
+
+This rules that out. Same GPU, same driver, same models, only the backend
+changes. If the cliff were physical it would appear here too.
+
+It does not. Throughput rises monotonically from 8 all the way to 32:
+
+  llama-bench -p 512, Intel Arc Pro B60, SYCL backend
+
+  n_ubatch              8        9       12       16       24       32
+  qwen2 1B BF16      611.7    673.9    893.1   1210.1   1601.4   2195.3  t/s
+  qwen2 7B Q4_K_M    619.0    655.8    853.2   1123.1   1175.5   1484.2  t/s
+
+  (full llama-bench output below)
+
+So the cliff is a property of the Vulkan backend's dispatch heuristic, not of
+the GPU. That is what makes it a bug rather than a hardware limit.
+
+Note on what the SYCL backend is doing underneath: it runs oneDNN and oneMKL,
+which this build reports as
+
+  GGML_SYCL_DNNL: yes
+  GGML_SYCL_ENABLE_DNN: 1
+  GGML_SYCL_FA_ONEDNN: 1
+  GGML_SYCL_ENABLE_MKL_FA: 1
+
+That is Intel's own stack for this hardware. It is used here only as a
+reference point - all of the work in this repository is on the Vulkan backend,
+which is vendor-neutral and therefore where a fix generalizes.
+
+
+Raw output
+----------
+| model                          |       size |     params | backend    | ngl | n_batch | n_ubatch |            test |                  t/s |
+| qwen2 1B BF16                  | 942.43 MiB |   494.03 M | SYCL       |  -1 |     512 |        8 |           pp512 |        611.68 ± 0.42 |
+| qwen2 1B BF16                  | 942.43 MiB |   494.03 M | SYCL       |  -1 |     512 |        9 |           pp512 |        673.87 ± 0.43 |
+| qwen2 1B BF16                  | 942.43 MiB |   494.03 M | SYCL       |  -1 |     512 |       12 |           pp512 |        893.13 ± 0.61 |
+| qwen2 1B BF16                  | 942.43 MiB |   494.03 M | SYCL       |  -1 |     512 |       16 |           pp512 |       1210.11 ± 0.44 |
+| qwen2 1B BF16                  | 942.43 MiB |   494.03 M | SYCL       |  -1 |     512 |       24 |           pp512 |       1601.39 ± 0.03 |
+| qwen2 1B BF16                  | 942.43 MiB |   494.03 M | SYCL       |  -1 |     512 |       32 |           pp512 |       2195.25 ± 2.33 |
+| qwen2 7B Q4_K - Medium         |   4.36 GiB |     7.62 B | SYCL       |  -1 |     512 |        8 |           pp512 |        618.99 ± 0.81 |
+| qwen2 7B Q4_K - Medium         |   4.36 GiB |     7.62 B | SYCL       |  -1 |     512 |        9 |           pp512 |        655.77 ± 0.66 |
+| qwen2 7B Q4_K - Medium         |   4.36 GiB |     7.62 B | SYCL       |  -1 |     512 |       12 |           pp512 |        853.17 ± 1.36 |
+| qwen2 7B Q4_K - Medium         |   4.36 GiB |     7.62 B | SYCL       |  -1 |     512 |       16 |           pp512 |       1123.08 ± 1.50 |
+| qwen2 7B Q4_K - Medium         |   4.36 GiB |     7.62 B | SYCL       |  -1 |     512 |       24 |           pp512 |       1175.53 ± 0.99 |
+| qwen2 7B Q4_K - Medium         |   4.36 GiB |     7.62 B | SYCL       |  -1 |     512 |       32 |           pp512 |       1484.22 ± 1.32 |
