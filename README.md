@@ -108,6 +108,15 @@ device. With N sequences decoding concurrently that count **is** N, so the
 constant caps token-generation throughput as soon as more than 8 sequences are
 in flight — the common case for a server holding several sessions.
 
+### Where the 8 came from
+
+It was never a tuned value. `git log -S` puts its introduction in
+**#10991, 2024-12-30, "vulkan: optimize mul_mat for small values of N"** — the
+commit that first made the mul_mat_vec shaders support N>1 at all, with
+`NUM_COLS` as a spec constant. The 8 is how far that optimization was taken.
+It has not been revisited since, including when hardware with cooperative-matrix
+units arrived. A feature's upper bound became a tuning constant by sitting still.
+
 Move a batch across the switch with a single sequence:
 
 | device | `-ub 8` | `-ub 9` | `-ub 12` | `-ub 16` |
@@ -129,6 +138,40 @@ compiles exactly the shaders it compiled before — raising the bound costs
 pointers, not shader compilation. Only Intel parts with cooperative-matrix
 support are raised, which is the configuration the 32 was measured on; every
 other device keeps today's behaviour rather than inheriting an unmeasured number.
+
+### What the constant actually is on each vendor
+
+The same `8` is doing two completely different jobs:
+
+- **On Arc it is an artificial ceiling.** The gemv path keeps scaling to 32
+  columns; nothing about the hardware objects to 9. The same silicon under SYCL
+  shows no cliff at all, which is what makes it a software boundary rather than
+  a physical one.
+- **On NVIDIA it is a correctly placed handoff.** Past 8, the GEMM path really
+  is faster there, and forcing gemv further *hurts* — 0.42× at 16.
+
+So there is no single value that can be right, and that is the argument: the fix
+is not a bigger number (a bigger number is exactly what breaks NVIDIA), it is
+that the number belongs to the device.
+
+It also fails silently. Nothing crashes and nothing warns — throughput simply
+drops by roughly 4× the moment a ninth concurrent request arrives, and everything
+still returns correct results. That is how it survived two years.
+
+### What this patch does not fix
+
+A static per-device table can only encode hardware someone happened to own. This
+one raises Intel parts with cooperative-matrix support because that is what was
+measured; every other device keeps 8 forever, including devices that would do
+better at 16 or 24 and whose owners will never find out. That is the same flaw as
+the original constant, with two entries instead of one.
+
+The principled fix is a startup micro-benchmark with a cached result — time a
+gemv at {8, 16, 32} once per (device, driver, type) and reuse the winner, the way
+FFTW keeps wisdom files. Roughly three measurements and tens of milliseconds, and
+it adapts to hardware no contributor owns. That is a much larger change with real
+costs to reproducibility and CI determinism, so it is noted here as the direction
+rather than proposed as part of this patch.
 
 ---
 
